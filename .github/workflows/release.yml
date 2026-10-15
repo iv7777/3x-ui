@@ -2,11 +2,11 @@ name: Release 3X-UI
 
 on:
   workflow_dispatch:
-  # Only main (dev channel) and version tags ship binaries; build any other
+  # Only my-branch (dev channel) and version tags ship binaries; build any other
   # branch on demand via workflow_dispatch.
   push:
     branches:
-      - main
+      - my-branch
     tags:
       - "v*.*.*"
     paths:
@@ -342,14 +342,14 @@ jobs:
   #  Rolling dev channel (per-commit)
   # =================================
   # Publishes/overwrites the build artifacts to a single fixed-tag pre-release
-  # `dev-latest`, force-moved to the new commit on every push to main. The panel's
+  # `dev-latest`, force-moved to the new commit on every push to my-branch. The panel's
   # "Dev" update channel installs from this tag. `--latest=false` is load-bearing:
   # it keeps releases/latest pointing at the real stable tag, so the stable
   # channel is unaffected.
   publish-dev:
     name: Publish rolling dev release
     needs: [build, build-windows]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/my-branch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -388,7 +388,7 @@ jobs:
           commit=${COMMIT}
           built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          Automated per-commit build from main. Not a stable release."
+          Automated per-commit build from my-branch. Not a stable release."
 
           # Force-move the dev-latest tag to this commit so the release tracks it.
           git tag -f dev-latest "${COMMIT}"
