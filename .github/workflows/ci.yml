@@ -12,8 +12,8 @@ on:
       - ".github/workflows/ci.yml"
   push:
     branches:
-      - main
       - my-branch
+      - dev
     paths:
       - "**.go"
       - "go.mod"

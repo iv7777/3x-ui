@@ -74,6 +74,12 @@ file locations when it can answer in one hop.
   link/subscription generation in `docs/lib/xray/` — check it whenever
   share-link or install-command output changes.
 
+## Branches (this fork, iv7777/3x-ui)
+- `main` mirrors MHSanaei/3x-ui and is never committed to. `dev` takes every new
+  commit (CI + rolling `dev-latest` pre-release). `my-branch` is the release line:
+  fast-forward it from `dev`, then tag `vX.Y.Z` (bump `internal/config/version`)
+  for an official release.
+
 ## Hard rules (non-negotiable)
 - Correct fix over small fix. Find the root cause and fix it the right way, however
   much code that takes. Size the change by what the correct fix needs, never by

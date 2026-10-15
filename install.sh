@@ -1695,7 +1695,7 @@ verify_release_checksum() {
 require_repo_files() {
     local ref="$1" name status
     shift
-    [[ "${ref}" == "my-branch" ]] && return 0
+    [[ "${ref}" == "dev" ]] && return 0
     for name in "$@"; do
         status=$(curl -sIL --retry 3 --connect-timeout 15 -o /dev/null -w '%{http_code}' "https://raw.githubusercontent.com/iv7777/3x-ui/${ref}/${name}")
         if [[ "${status}" != "200" ]]; then
@@ -1761,10 +1761,10 @@ install_x-ui() {
         verify_release_checksum "${url}" "${xui_folder}-linux-$(arch).tar.gz"
     fi
     # x-ui.sh, x-ui.rc and the unit files must come from the same release as
-    # the binary; only the rolling dev build tracks my-branch.
+    # the binary; only the rolling dev build tracks dev.
     local script_ref="${tag_version}"
     if [[ "${tag_version}" == "dev-latest" ]]; then
-        script_ref="my-branch"
+        script_ref="dev"
     fi
     # The unit files are only fetched when the release tarball lacks them, so
     # they are checked at that point instead of here.
