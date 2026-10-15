@@ -1,18 +1,10 @@
 name: Docs Deploy (GitHub Pages)
 
-# Static-export deploy of docs/ to GitHub Pages. Pages must be enabled in repo
+# Manual-only on this fork: static-export deploy of docs/ to GitHub Pages. Pages must be enabled in repo
 # settings (Source: GitHub Actions) and the docs.sanaei.dev custom domain
 # attached to this repository. The site URL defaults to the production domain in
 # docs/lib/shared.ts, so NEXT_PUBLIC_SITE_URL is optional.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'docs/**'
-      - 'frontend/src/components/**'
-      - 'frontend/.storybook/**'
-      - 'frontend/package-lock.json'
-      - '.github/workflows/docs-deploy.yml'
   workflow_dispatch:
 
 permissions:

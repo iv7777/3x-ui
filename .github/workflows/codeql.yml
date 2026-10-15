@@ -3,7 +3,8 @@ name: "CodeQL Advanced"
 on:
   push:
     branches:
-      - main
+      - my-branch
+      - dev
     tags-ignore:
       - "v*"
     paths:
