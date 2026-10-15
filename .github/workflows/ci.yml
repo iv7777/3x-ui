@@ -13,6 +13,7 @@ on:
   push:
     branches:
       - main
+      - my-branch
     paths:
       - "**.go"
       - "go.mod"
