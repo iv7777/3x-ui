@@ -1,0 +1,30 @@
+name: Release notes
+
+# Rewrites the notes of an existing release, e.g. to backfill one published
+# before release.yml wrote notes itself.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag, e.g. v3.10.3
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Publish notes on the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          .github/scripts/release-notes.sh "${TAG}" > notes.md
+          gh release edit "${TAG}" --notes-file notes.md
