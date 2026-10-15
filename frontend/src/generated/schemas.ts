@@ -3073,7 +3073,7 @@ export const SCHEMAS: Record<string, unknown> = {
         "nullable": true
       },
       "fallbacks": {
-        "description": "Fallbacks is the inbound's full rule list as panels exchange it. Nil\nmeans \"not reported\" (old build, or an inbound that cannot host them), so\nit is never read as \"no rules\". Not persisted.",
+        "description": "Fallbacks is the inbound's rule list as panels exchange it; nil means\n\"not reported\" (old build), never \"no rules\". Not persisted.",
         "items": {
           "$ref": "#/components/schemas/FallbackWire"
         },
