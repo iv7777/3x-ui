@@ -3,12 +3,14 @@ package discord
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -288,6 +290,13 @@ func TestGatewayClient_EndToEndCommands(t *testing.T) {
 	}
 }
 
+// clientHungUp: the zombie check may drop a starved client's socket mid-flood, which is not a corrupt frame.
+func clientHungUp(err error) bool {
+	var closeErr *websocket.CloseError
+	return errors.As(err, &closeErr) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+}
+
 func TestGatewayRequestedHeartbeatDoesNotRaceTicker(t *testing.T) {
 	settingService := setupTestDB(t)
 	_ = settingService.SetDiscordBotEnable(true)
@@ -344,7 +353,9 @@ func TestGatewayRequestedHeartbeatDoesNotRaceTicker(t *testing.T) {
 		}
 		select {
 		case err := <-readErr:
-			t.Errorf("server read a broken client frame during the flood: %v", err)
+			if !clientHungUp(err) {
+				t.Errorf("server read a broken client frame during the flood: %v", err)
+			}
 		default:
 		}
 		once.Do(func() { close(flooded) })

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"runtime"
@@ -132,6 +133,29 @@ func audit3ReceivePacket(c *clientquic.Conn, mode uint8, duration time.Duration)
 	return h, p, err
 }
 
+const recoveryResponseWait = 3 * time.Second
+
+// audit3AwaitPayload skips the reply to the packet sent while the bridge was down, which may or may not be delivered first.
+func audit3AwaitPayload(c *clientquic.Conn, mode uint8, assoc uint16, want string) ([]byte, error) {
+	deadline := time.Now().Add(recoveryResponseWait)
+	for {
+		h, p, err := audit3ReceivePacket(c, mode, time.Until(deadline))
+		if err != nil {
+			return nil, err
+		}
+		if string(p) == "while-down" && h.AssocID == 42131 {
+			continue
+		}
+		if h.AssocID != assoc {
+			return p, fmt.Errorf("reply for association %d, want %d", h.AssocID, assoc)
+		}
+		if string(p) != want {
+			return p, fmt.Errorf("reply %q, want %q", p, want)
+		}
+		return p, nil
+	}
+}
+
 func TestAudit3UDPAssociationMustRecoverAfterBridgeReadFailure(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Go disables SIO_UDP_CONNRESET on Windows, so a dead UDP bridge never fails a read there")
@@ -181,15 +205,15 @@ func TestAudit3UDPAssociationMustRecoverAfterBridgeReadFailure(t *testing.T) {
 			audit3SendPacket(t, c, mode, 42131, 3, "after")
 			select {
 			case <-arrived:
-			case <-time.After(time.Second):
+			case <-time.After(recoveryResponseWait):
 				t.Fatal("restarted bridge did not receive the retained association request")
 			}
-			_, payload, oldErr := audit3ReceivePacket(c, mode, 300*time.Millisecond)
+			payload, oldErr := audit3AwaitPayload(c, mode, 42131, "after")
 			// A different association proves QUIC, the restarted SOCKS bridge, and both transport modes remain functional.
 			audit3SendPacket(t, c, mode, 42132, 4, "fresh")
-			h, p, newErr := audit3ReceivePacket(c, mode, time.Second)
-			if newErr != nil || h.AssocID != 42132 || string(p) != "fresh" {
-				t.Fatalf("fresh association probe %v %q %v", h, p, newErr)
+			p, newErr := audit3AwaitPayload(c, mode, 42132, "fresh")
+			if newErr != nil || string(p) != "fresh" {
+				t.Fatalf("fresh association probe %q %v", p, newErr)
 			}
 			if oldErr != nil || string(payload) != "after" {
 				t.Fatalf("retained association became receive blackhole after read failure: response %q err=%v; fresh association works; user up=%d down=%d", payload, oldErr, user.Traffic.BytesUp.Load(), user.Traffic.BytesDown.Load())
