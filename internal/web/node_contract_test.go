@@ -215,6 +215,36 @@ func TestMasterNodeContract(t *testing.T) {
 						t.Fatalf("node subSortIndex = %d, want 7", ib.SubSortIndex)
 					}
 				}},
+				{"UpdateInbound hands fallback rules to the node and the snapshot reports them back", []string{"UpdateInbound", "FetchTrafficSnapshot"}, func() error {
+					ib := masterInbound("updated", false, "c0", "c1", "c2")
+					ib.StreamSettings = `{"network":"tcp","security":"tls","tlsSettings":{"serverName":"s","certificates":[{"certificateFile":"/c.pem","keyFile":"/k.pem"}]}}`
+					ib.Fallbacks = &model.FallbackSet{{Dest: "127.0.0.1:8081", Path: "/fb", Alpn: "h2", Xver: 1}}
+					return master.UpdateInbound(ctx, ib, ib)
+				}, func(t *testing.T) {
+					ib, _ := nodeRow(t, contractTag)
+					var rows []model.InboundFallback
+					if err := database.GetDB().Where("master_id = ?", ib.Id).Find(&rows).Error; err != nil {
+						t.Fatalf("load node fallback rows: %v", err)
+					}
+					if len(rows) != 1 || rows[0].Dest != "127.0.0.1:8081" || rows[0].Path != "/fb" || rows[0].Alpn != "h2" || rows[0].Xver != 1 {
+						t.Fatalf("node fallback rows = %+v, want the pushed rule", rows)
+					}
+					snap, err := master.FetchTrafficSnapshot(ctx)
+					if err != nil {
+						t.Fatalf("snapshot: %v", err)
+					}
+					for _, got := range snap.Inbounds {
+						if got.Tag != contractTag {
+							continue
+						}
+						want := model.FallbackSet{{Dest: "127.0.0.1:8081", Path: "/fb", Alpn: "h2", Xver: 1}}
+						if got.Fallbacks == nil || !reflect.DeepEqual(*got.Fallbacks, want) {
+							t.Fatalf("snapshot Fallbacks = %v, want %v", got.Fallbacks, want)
+						}
+						return
+					}
+					t.Fatal("snapshot has no contract inbound")
+				}},
 				{"AddClient attaches one client", []string{"AddClient"}, func() error {
 					return master.AddClient(ctx, masterInbound("updated", false), model.Client{
 						Email: "c3", ID: "0b6d5c2e-7c1a-4f4e-9d3b-000000000003", SubID: "s-c3", Enable: true,

@@ -38,10 +38,11 @@ func run(root, outDir string) error {
 				"ClientRecord",
 				"ClientInbound",
 				"InboundFallback",
+				"FallbackWire",
 				"Host",
 				"SubBalancer",
 			),
-			AliasAllow: setOf("Protocol"),
+			AliasAllow: setOf("Protocol", "FallbackSet"),
 			Overrides: map[string][]walkOverride{
 				"Inbound": {
 					{Field: "Settings", Kind: KindAny},

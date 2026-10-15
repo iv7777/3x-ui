@@ -2434,6 +2434,31 @@ export const SCHEMAS: Record<string, unknown> = {
     ],
     "type": "object"
   },
+  "FallbackWire": {
+    "description": "FallbackWire is one fallback rule as two panels exchange it. Dest is always\nresolved, so no panel-local inbound id crosses the wire.",
+    "properties": {
+      "alpn": {
+        "type": "string"
+      },
+      "dest": {
+        "example": "127.0.0.1:8081",
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "xver": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "dest"
+    ],
+    "type": "object"
+  },
   "GeoCategory": {
     "description": "GeoCategory is one code inside a database, such as geosite's \"google\".",
     "properties": {
@@ -3046,6 +3071,14 @@ export const SCHEMAS: Record<string, unknown> = {
         ],
         "description": "FallbackParent is populated by the API layer when this inbound is\nattached as a fallback child of a VLESS/Trojan TCP-TLS master.\nThe frontend uses it to rewrite client-share links so they advertise\nthe master's externally reachable endpoint instead of the child's\nloopback listen. Not persisted.",
         "nullable": true
+      },
+      "fallbacks": {
+        "description": "Fallbacks is the inbound's full rule list as panels exchange it. Nil\nmeans \"not reported\" (old build, or an inbound that cannot host them), so\nit is never read as \"no rules\". Not persisted.",
+        "items": {
+          "$ref": "#/components/schemas/FallbackWire"
+        },
+        "nullable": true,
+        "type": "array"
       },
       "id": {
         "description": "Unique identifier",

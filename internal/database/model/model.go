@@ -90,6 +90,36 @@ type Inbound struct {
 	// the master's externally reachable endpoint instead of the child's
 	// loopback listen. Not persisted.
 	FallbackParent *FallbackParentInfo `json:"fallbackParent,omitempty" gorm:"-"`
+
+	// Fallbacks is the inbound's rule list as panels exchange it; nil means
+	// "not reported" (old build), never "no rules". Not persisted.
+	Fallbacks *FallbackSet `json:"fallbacks,omitempty" form:"fallbacks" gorm:"-"`
+}
+
+// FallbackWire is one fallback rule as two panels exchange it. Dest is always
+// resolved, so no panel-local inbound id crosses the wire.
+type FallbackWire struct {
+	Dest string `json:"dest" example:"127.0.0.1:8081"`
+	Name string `json:"name,omitempty"`
+	Alpn string `json:"alpn,omitempty"`
+	Path string `json:"path,omitempty"`
+	Xver int    `json:"xver,omitempty"`
+}
+
+// FallbackSet is the ordered rule list of one inbound.
+type FallbackSet []FallbackWire
+
+// UnmarshalParam lets the node's form binding read the JSON-encoded list a
+// master sends in the "fallbacks" field.
+func (s *FallbackSet) UnmarshalParam(param string) error {
+	set := FallbackSet{}
+	if strings.TrimSpace(param) != "" {
+		if err := json.Unmarshal([]byte(param), &set); err != nil {
+			return fmt.Errorf("fallbacks: %w", err)
+		}
+	}
+	*s = set
+	return nil
 }
 
 // FallbackParentInfo carries everything the frontend needs to rewrite a

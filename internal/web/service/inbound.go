@@ -198,8 +198,44 @@ func (s *InboundService) GetInbounds(userId int) ([]*model.Inbound, error) {
 	}
 	s.enrichClientStats(db, inbounds)
 	s.annotateFallbackParents(db, inbounds)
+	if err := s.annotateFallbacks(db, inbounds); err != nil {
+		return nil, err
+	}
 	s.annotateLocalOriginGuid(inbounds)
 	return inbounds, nil
+}
+
+// takePushedFallbacks returns the rule set a master pushed and drops the settings
+// copy: the table is the node's only truth, so a stale copy cannot outlive a removed rule.
+func takePushedFallbacks(inbound *model.Inbound) *model.FallbackSet {
+	if inbound.Fallbacks == nil || !inboundCanHostFallbacks(inbound) {
+		return nil
+	}
+	if stripped, changed := removeSettingsFallbacks(inbound.Settings); changed {
+		inbound.Settings = stripped
+	}
+	return inbound.Fallbacks
+}
+
+// annotateFallbacks reports each fallback-capable inbound's full rule set (empty
+// included) so a master panel can mirror rules edited on this node.
+func (s *InboundService) annotateFallbacks(db *gorm.DB, inbounds []*model.Inbound) error {
+	ids := make([]int, 0, len(inbounds))
+	for _, ib := range inbounds {
+		if inboundCanHostFallbacks(ib) {
+			ids = append(ids, ib.Id)
+		}
+	}
+	byMaster, err := s.fallbackService.WireByMasters(db, ids)
+	if err != nil {
+		return err
+	}
+	for _, ib := range inbounds {
+		if set, ok := byMaster[ib.Id]; ok && inboundCanHostFallbacks(ib) {
+			ib.Fallbacks = &set
+		}
+	}
+	return nil
 }
 
 // annotateLocalOriginGuid fills OriginNodeGuid for this panel's OWN inbounds
@@ -1230,6 +1266,7 @@ func (s *InboundService) normalizeMtprotoXrayPort(inbound *model.Inbound, oldSet
 // Returns the created inbound, whether Xray needs restart, and any error.
 func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, bool, error) {
 	inbound.Id = 0
+	pushedFallbacks := takePushedFallbacks(inbound)
 	if err := normalizeTuicSettings(inbound); err != nil {
 		return inbound, false, err
 	}
@@ -1396,6 +1433,13 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 		markDirty := false
 		if err := tx.Omit("ClientStats").Save(inbound).Error; err != nil {
 			return err
+		}
+		if pushedFallbacks != nil {
+			changed, fbErr := s.fallbackService.ApplyWire(tx, inbound, *pushedFallbacks)
+			if fbErr != nil {
+				return fbErr
+			}
+			needRestart = needRestart || changed
 		}
 		// The relay port is derived from the id, only known after Save, and only a
 		// local row owns one: checkPortConflictTx ran no relay check with ignoreId==0.
@@ -1924,6 +1968,7 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 		return inbound, false, err
 	}
 	inbound.SubSortIndex = normalizeSubSortIndex(inbound.SubSortIndex)
+	pushedFallbacks := takePushedFallbacks(inbound)
 
 	// Grandfather a row that was already stored incomplete so it stays editable;
 	// only a save that breaks a previously valid TLS block is refused.
@@ -2187,6 +2232,13 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 		if err := tx.Save(oldInbound).Error; err != nil {
 			return err
 		}
+		if pushedFallbacks != nil {
+			changed, fbErr := s.fallbackService.ApplyWire(tx, oldInbound, *pushedFallbacks)
+			if fbErr != nil {
+				return fbErr
+			}
+			needRestart = needRestart || changed
+		}
 		newClients, gcErr := s.GetClients(oldInbound)
 		if gcErr != nil {
 			return gcErr
@@ -2275,19 +2327,23 @@ func (s *InboundService) buildInboundForNodePush(tx *gorm.DB, inbound *model.Inb
 		return nil, err
 	}
 
+	built.Fallbacks = nil
 	if !inboundCanHostFallbacks(inbound) {
 		return &built, nil
 	}
-	fallbacks, err := s.fallbackService.BuildFallbacksJSON(tx, inbound.Id)
+	set, err := s.fallbackService.WireByMaster(tx, inbound.Id)
 	if err != nil {
 		return nil, err
 	}
-	if len(fallbacks) == 0 {
+	built.Fallbacks = &set
+	if len(set) == 0 {
 		return &built, nil
 	}
-	generic := make([]any, 0, len(fallbacks))
-	for _, f := range fallbacks {
-		generic = append(generic, f)
+	// Nodes that predate the Fallbacks field only read the settings copy.
+	entries := fallbackEntries(set)
+	generic := make([]any, 0, len(entries))
+	for _, e := range entries {
+		generic = append(generic, e)
 	}
 	settings["fallbacks"] = generic
 

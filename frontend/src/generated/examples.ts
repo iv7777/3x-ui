@@ -614,6 +614,13 @@ export const EXAMPLES: Record<string, unknown> = {
     "masterId": 0,
     "path": ""
   },
+  "FallbackWire": {
+    "alpn": "",
+    "dest": "127.0.0.1:8081",
+    "name": "",
+    "path": "",
+    "xver": 0
+  },
   "GeoCategory": {
     "attributes": [
       "ads",
@@ -799,6 +806,7 @@ export const EXAMPLES: Record<string, unknown> = {
     "excludeFromSub": false,
     "expiryTime": 0,
     "fallbackParent": null,
+    "fallbacks": null,
     "id": 1,
     "lastTrafficResetTime": 0,
     "listen": "",

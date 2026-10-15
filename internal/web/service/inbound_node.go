@@ -426,6 +426,13 @@ func (s *InboundService) GetNodeInboundTrafficTotals() (map[string][2]int64, err
 	return out, nil
 }
 
+// settingsWithoutFallbacks removes the settings.fallbacks copy, leaving the
+// string byte-identical when there is none.
+func settingsWithoutFallbacks(settings string) string {
+	stripped, _ := removeSettingsFallbacks(settings)
+	return stripped
+}
+
 func adoptedWireChanged(c, snapIb *model.Inbound, adoptedSettings string) bool {
 	return c.Settings != adoptedSettings ||
 		c.Enable != snapIb.Enable ||
@@ -712,6 +719,13 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 		wireSettings string
 	}
 	var pendingAdopts []pendingAdopt
+	// Applied once every new inbound exists, so a rule pointing at a sibling
+	// reported in the same snapshot still links to it.
+	type fallbackAdoption struct {
+		inbound *model.Inbound
+		set     model.FallbackSet
+	}
+	var fallbackAdoptions []fallbackAdoption
 	degradedInbounds := map[int]string{}
 
 	newInboundIDs := make(map[int]struct{})
@@ -808,7 +822,7 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 				Listen:               snapIb.Listen,
 				Port:                 snapIb.Port,
 				Protocol:             snapIb.Protocol,
-				Settings:             snapIb.Settings,
+				Settings:             settingsWithoutFallbacks(snapIb.Settings),
 				StreamSettings:       snapIb.StreamSettings,
 				Sniffing:             snapIb.Sniffing,
 				TrafficReset:         snapIb.TrafficReset,
@@ -833,6 +847,9 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 			if newIb.Tag != snapIb.Tag {
 				tagToCentral[newIb.Tag] = &newIb
 			}
+			if snapIb.Fallbacks != nil && inboundCanHostFallbacks(snapIb) {
+				fallbackAdoptions = append(fallbackAdoptions, fallbackAdoption{&newIb, *snapIb.Fallbacks})
+			}
 			if rows := adoptedHostRows(snap.HostGroups, snapIb.Id, newIb.Id); len(rows) > 0 {
 				if err := tx.Create(&rows).Error; err != nil {
 					logger.Warningf("setRemoteTraffic: adopt host rows for tag %q failed: %v", newIb.Tag, err)
@@ -855,6 +872,9 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 		if deduped, changed := dedupeSettingsClients(adoptedSettings); changed {
 			adoptedSettings = deduped
 		}
+		// The rules are mirrored into inbound_fallbacks below; a stored copy would
+		// outlive them.
+		adoptedSettings = settingsWithoutFallbacks(adoptedSettings)
 		updates := map[string]any{}
 		if !dirty && snapshotDropsEveryHubClient(tx, c.Id, adoptedSettings) {
 			degradedInbounds[c.Id] = c.Tag
@@ -864,6 +884,9 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 			pendingAdopts = append(pendingAdopts, pendingAdopt{
 				central: c, snapIb: snapIb, wireSettings: adoptedSettings,
 			})
+			if snapIb.Fallbacks != nil && inboundCanHostFallbacks(snapIb) {
+				fallbackAdoptions = append(fallbackAdoptions, fallbackAdoption{c, *snapIb.Fallbacks})
+			}
 			updates["enable"] = snapIb.Enable
 			updates["remark"] = snapIb.Remark
 			updates["sub_sort_index"] = normalizeSubSortIndex(snapIb.SubSortIndex)
@@ -904,6 +927,18 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 				Updates(updates).Error; err != nil {
 				return false, err
 			}
+		}
+	}
+
+	fallbacksAdopted := map[int]*model.Inbound{}
+	for _, a := range fallbackAdoptions {
+		changed, err := s.fallbackService.ApplyWire(tx, a.inbound, a.set)
+		if err != nil {
+			return false, err
+		}
+		if changed {
+			fallbacksAdopted[a.inbound.Id] = a.inbound
+			structuralChange = true
 		}
 	}
 
@@ -1465,12 +1500,24 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 		}
 	}
 
+	for _, ib := range adoptedInbounds {
+		delete(fallbacksAdopted, ib.Id)
+	}
+	for _, ib := range fallbacksAdopted {
+		adoptedInbounds = append(adoptedInbounds, ib)
+	}
 	if len(adoptedInbounds) > 0 {
 		if mgr := runtime.GetManager(); mgr != nil {
 			if rt, rtErr := mgr.RuntimeFor(&nodeID); rtErr == nil {
 				if rem, ok := rt.(*runtime.Remote); ok {
 					for _, ib := range adoptedInbounds {
-						rem.RecordAdoptedInbound(ib)
+						// Stamp the payload reconcile would build, so the node's own
+						// rules do not read as a master edit to push back.
+						payload := ib
+						if built, bErr := s.buildInboundForNodePush(database.GetDB(), ib); bErr == nil {
+							payload = built
+						}
+						rem.RecordAdoptedInbound(payload)
 					}
 				}
 			}

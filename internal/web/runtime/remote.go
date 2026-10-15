@@ -850,6 +850,15 @@ func wireInbound(ib *model.Inbound, remoteNodeID int) url.Values {
 	v.Set("port", strconv.Itoa(ib.Port))
 	v.Set("protocol", string(ib.Protocol))
 	v.Set("settings", ib.Settings)
+	if ib.Fallbacks != nil {
+		set := *ib.Fallbacks
+		if set == nil {
+			set = model.FallbackSet{}
+		}
+		if raw, err := json.Marshal(set); err == nil {
+			v.Set("fallbacks", string(raw))
+		}
+	}
 	v.Set("streamSettings", sanitizeStreamSettingsForRemote(ib.StreamSettings))
 	tag := ib.Tag
 	if remoteNodeID > 0 {

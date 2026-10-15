@@ -107,6 +107,8 @@ func runNodeSyncScenarios(t *testing.T, bin, scope string) {
 		offlinePort   = freePort(t)
 		unmanagedPort = freePort(t)
 		localPort     = freePort(t)
+		fallbackPort  = freePort(t)
+		fbChildPort   = freePort(t)
 	)
 	node.call(http.MethodPost, "/panel/api/inbounds/add", vlessInbound("pre-existing", adoptedPort, nil))
 
@@ -303,6 +305,53 @@ func runNodeSyncScenarios(t *testing.T, bin, scope string) {
 		pr.waitNode("node holds the edited inbound with o1", offlinePort, func(ib inboundView) bool {
 			return ib.Remark == "edited-while-down" && ib.client("o1") != nil
 		})
+	})
+
+	t.Run("fallback rules converge between master and node, the master winning a clash", func(t *testing.T) {
+		pr.t = t
+		tlsStream := `{"network":"tcp","security":"tls","tlsSettings":{"serverName":"s","certificates":[{"certificateFile":"/c.pem","keyFile":"/k.pem"}]}}`
+		host := vlessInbound("fallback-host", fallbackPort, &pr.nodeID)
+		host["streamSettings"] = tlsStream
+		var hostIb inboundView
+		_ = json.Unmarshal(master.call(http.MethodPost, "/panel/api/inbounds/add", host), &hostIb)
+		master.call(http.MethodPost, "/panel/api/inbounds/add", vlessInbound("fallback-child", fbChildPort, &pr.nodeID))
+		pr.waitNode("node holds the fallback host", fallbackPort, func(ib inboundView) bool { return ib.Id != 0 })
+		nodeIb, _ := pr.nodeInbound(fallbackPort)
+		dest := "127.0.0.1:" + strconv.Itoa(fbChildPort)
+
+		setRule := func(p *panel, id int, path string) {
+			p.call(http.MethodPost, "/panel/api/inbounds/"+strconv.Itoa(id)+"/fallbacks",
+				map[string]any{"fallbacks": []map[string]any{{"dest": dest, "path": path}}})
+		}
+		waitPaths := func(what string, p *panel, id int, want ...string) {
+			t.Helper()
+			eventually(t, settleTimeout, what, func() (bool, string) {
+				var rules []struct {
+					Path string `json:"path"`
+				}
+				_ = json.Unmarshal(p.call(http.MethodGet, "/panel/api/inbounds/"+strconv.Itoa(id)+"/fallbacks", nil), &rules)
+				got := make([]string, 0, len(rules))
+				for _, r := range rules {
+					got = append(got, r.Path)
+				}
+				return slices.Equal(got, want), fmt.Sprintf("paths = %v, want %v", got, want)
+			})
+		}
+		masterHost, _ := pr.masterInbound(fallbackPort)
+
+		setRule(master, masterHost.Id, "/from-master")
+		waitPaths("node shows the master's rule in its own table", node, nodeIb.Id, "/from-master")
+
+		setRule(node, nodeIb.Id, "/from-node")
+		waitPaths("master adopts the rule edited on the node", master, masterHost.Id, "/from-node")
+
+		setRule(node, nodeIb.Id, "/node-clash")
+		setRule(master, masterHost.Id, "/master-clash")
+		waitPaths("master keeps its edit when both sides changed", master, masterHost.Id, "/master-clash")
+		waitPaths("node ends on the master's edit", node, nodeIb.Id, "/master-clash")
+
+		master.call(http.MethodPost, "/panel/api/inbounds/"+strconv.Itoa(masterHost.Id)+"/fallbacks", map[string]any{"fallbacks": []map[string]any{}})
+		waitPaths("clearing the rules on the master clears the node", node, nodeIb.Id)
 	})
 
 	t.Run("a change made while the node is disabled on the master lands once it is re-enabled", func(t *testing.T) {
