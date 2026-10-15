@@ -93,6 +93,8 @@ During installation a random username, password, and access path are generated. 
 
 Every release asset is published with a `.sha256` sum next to it. Both `install.sh` and the updater verify the archive against that sum and abort on a mismatch.
 
+Before it replaces anything, the updater saves the current program files and the SQLite database to `/etc/x-ui/backups/` (the newest 3 are kept). If the new version fails to unpack, migrate or stay running, the updater puts the old one back by itself; you can also undo an update later with `x-ui rollback`. PostgreSQL data is not part of these backups.
+
 For full documentation — installation, configuration, operations, and the complete API reference — visit **[docs.sanaei.dev](https://docs.sanaei.dev)**.
 
 ### Unattended install

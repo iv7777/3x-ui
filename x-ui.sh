@@ -242,6 +242,63 @@ update_menu() {
     fi
 }
 
+# Value of a variable the panel's service reads from its environment file ("" when unset).
+xui_env_value() {
+    local env_file
+    env_file="$(xui_env_file_path)"
+    [[ -r "$env_file" ]] || return 0
+    grep -E "^$1=" "$env_file" | tail -1 | cut -d= -f2- | sed -e "s/^['\"]//" -e "s/['\"]$//"
+}
+
+# Backups saved by update.sh live here; each one has the program files, the SQLite
+# database and a restore.sh that puts both back.
+xui_backup_root() {
+    local root db_dir
+    root="$(xui_env_value XUI_BACKUP_FOLDER)"
+    db_dir="$(xui_env_value XUI_DB_FOLDER)"
+    echo "${root:-${db_dir:-/etc/x-ui}/backups}"
+}
+
+rollback() {
+    local root dir choice i=0
+    local dirs=()
+    root="$(xui_backup_root)"
+    mapfile -t dirs < <(find "$root" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*-[0-9]*-*' 2> /dev/null | sort -r)
+    if [[ ${#dirs[@]} -eq 0 ]]; then
+        LOGE "No update backups found in ${root}"
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    fi
+
+    echo -e "${green}Saved before each update (newest first):${plain}"
+    for dir in "${dirs[@]}"; do
+        i=$((i + 1))
+        echo -e "  ${green}${i}.${plain} $(basename "$dir")  ($(du -sh "$dir" 2> /dev/null | cut -f1))"
+    done
+    read -rp "Restore which one? [1-${#dirs[@]}, default 1, 0 to cancel]: " choice
+    choice="${choice:-1}"
+    if [[ "$choice" == "0" ]]; then
+        LOGI "Cancelled"
+        [[ $# == 0 ]] && before_show_menu
+        return 0
+    fi
+    if [[ ! "$choice" =~ ^[0-9]+$ || "$choice" -lt 1 || "$choice" -gt ${#dirs[@]} ]]; then
+        LOGE "Please enter a number from 0 to ${#dirs[@]}"
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    fi
+    dir="${dirs[$((choice - 1))]}"
+
+    confirm "This puts the program files and the database back as they were in $(basename "$dir"); anything changed since is lost. Continue?" "n"
+    if [[ $? != 0 ]]; then
+        LOGE "Cancelled"
+        [[ $# == 0 ]] && before_show_menu
+        return 0
+    fi
+    bash "$dir/restore.sh"
+    [[ $# == 0 ]] && before_show_menu
+}
+
 legacy_version() {
     echo -n "Enter the panel version (like 2.4.0):"
     read -r tag_version
@@ -3492,6 +3549,7 @@ show_usage() {
 │  ${blue}x-ui banlog${plain}                - Check Fail2ban ban logs          │
 │  ${blue}x-ui update${plain}                - Update                           │
 │  ${blue}x-ui update-dev${plain}            - Update to Dev channel (latest)   │
+│  ${blue}x-ui rollback${plain}              - Undo the last update             │
 │  ${blue}x-ui update-all-geofiles${plain}   - Update all geo files             │
 │  ${blue}x-ui migrateDB [file]${plain}      - Convert .db <-> .dump (SQLite)   │
 │  ${blue}x-ui pgclient [ver]${plain}        - Upgrade pg_dump/pg_restore tools │
@@ -3540,10 +3598,11 @@ show_menu() {
 │  ${green}26.${plain} Enable BBR                               │
 │  ${green}27.${plain} Update Geo Files                         │
 │  ${green}28.${plain} Speedtest by Ookla                       │
+│  ${green}29.${plain} Roll Back Last Update                    │
 ╚────────────────────────────────────────────────╝
 "
     show_status
-    echo && read -rp "Please enter your selection [0-28]: " num
+    echo && read -rp "Please enter your selection [0-29]: " num
 
     case "${num}" in
         0)
@@ -3633,8 +3692,11 @@ show_menu() {
         28)
             run_speedtest
             ;;
+        29)
+            check_install && rollback
+            ;;
         *)
-            LOGE "Please enter the correct number [0-28]"
+            LOGE "Please enter the correct number [0-29]"
             ;;
     esac
 }
@@ -3679,6 +3741,9 @@ if [[ $# > 0 ]]; then
             ;;
         "update-dev")
             check_install 0 && update_dev 0
+            ;;
+        "rollback")
+            check_install 0 && rollback 0
             ;;
         "legacy")
             check_install 0 && legacy_version 0

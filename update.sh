@@ -8,6 +8,7 @@ plain='\033[0m'
 
 xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
 xui_service="${XUI_SERVICE:=/etc/systemd/system}"
+xui_cmd="${XUI_BIN_LINK:=/usr/bin/x-ui}"
 
 # Don't edit this config
 b_source="${BASH_SOURCE[0]}"
@@ -249,20 +250,20 @@ setup_fail2ban() {
         return 0
     fi
 
-    if [[ ! -x /usr/bin/x-ui ]]; then
+    if [[ ! -x "${xui_cmd}" ]]; then
         echo -e "${yellow}x-ui CLI not found; skipping Fail2ban auto-setup.${plain}"
         return 0
     fi
 
     # Scripts older than v3.4.0 have no setup-fail2ban and exit 0 from the
     # usage banner, which would read as success here.
-    if ! grep -q '"setup-fail2ban")' /usr/bin/x-ui; then
+    if ! grep -q '"setup-fail2ban")' "${xui_cmd}"; then
         echo -e "${yellow}This x-ui.sh predates 'x-ui setup-fail2ban'; skipping Fail2ban auto-setup.${plain}"
         return 0
     fi
 
     echo -e "${green}Setting up Fail2ban for the IP Limit feature...${plain}"
-    if /usr/bin/x-ui setup-fail2ban; then
+    if "${xui_cmd}" setup-fail2ban; then
         echo -e "${green}Fail2ban setup complete.${plain}"
     else
         echo -e "${yellow}Fail2ban setup did not finish; IP Limit stays disabled until you run 'x-ui' and open the IP Limit menu. Continuing.${plain}"
@@ -498,6 +499,153 @@ require_repo_files() {
     done
 }
 
+# --- backup and rollback ------------------------------------------------------
+# update.sh removes the old program files before it unpacks the new ones, so a failed
+# update used to leave a dead panel. Everything it deletes, plus the SQLite database,
+# is saved first; restore.sh in the backup folder puts it back.
+xui_backup_keep="${XUI_BACKUP_KEEP:-3}"
+xui_backup_current=""
+
+xui_backup_root() {
+    echo "${XUI_BACKUP_FOLDER:-${XUI_DB_FOLDER:-/etc/x-ui}/backups}"
+}
+
+# Not being able to back up only warns: the operator asked for the update.
+backup_current_install() {
+    xui_backup_current=""
+    local root dir f
+    local db_dir="${XUI_DB_FOLDER:-/etc/x-ui}"
+    local files=()
+    root="$(xui_backup_root)"
+    if ! mkdir -p "${root}" > /dev/null 2>&1 ||
+        ! dir="$(mktemp -d "${root}/$(date +%Y%m%d-%H%M%S)-${current_xui_version:-unknown}.XXXXXX" 2> /dev/null)"; then
+        echo -e "${yellow}Cannot create a backup folder in ${root}; updating without a backup${plain}"
+        return 0
+    fi
+    chmod 700 "${root}" > /dev/null 2>&1
+
+    for f in "${xui_folder}/x-ui" "${xui_folder}/x-ui.sh" "${xui_folder}"/x-ui.service* \
+        "${xui_folder}"/bin/xray-linux-* "${xui_folder}"/bin/mtg-linux-* "${xui_folder}/bin/tuic-server" \
+        "${xui_folder}/bin/tuic" "${xui_folder}/bin/README.md" "${xui_folder}/bin/LICENSE" \
+        "${xui_cmd}" "${xui_service}/x-ui.service" /etc/init.d/x-ui; do
+        [[ -e "$f" ]] && files+=("$f")
+    done
+    if ! tar -czPf "${dir}/install.tar.gz" "${files[@]}" > /dev/null 2>&1; then
+        rm -rf -- "${dir}"
+        echo -e "${yellow}Could not save the current program files (disk full?); updating without a backup${plain}"
+        return 0
+    fi
+
+    local db_type="sqlite"
+    if [[ "${XUI_DB_TYPE:-sqlite}" == "postgres" ]]; then
+        db_type="postgres"
+    else
+        for f in "${db_dir}/x-ui.db" "${db_dir}/x-ui.db-wal" "${db_dir}/x-ui.db-shm"; do
+            [[ -f "$f" ]] || continue
+            if ! cp -p "$f" "${dir}/" > /dev/null 2>&1; then
+                rm -rf -- "${dir}"
+                echo -e "${yellow}Could not save the database (disk full?); updating without a backup${plain}"
+                return 0
+            fi
+        done
+    fi
+
+    {
+        printf 'XUI_BK_VERSION=%q\n' "${current_xui_version:-unknown}"
+        printf 'XUI_BK_DB_TYPE=%q\n' "${db_type}"
+        printf 'XUI_BK_DB_FOLDER=%q\n' "${db_dir}"
+        printf 'XUI_BK_OPENRC=%q\n' "$([[ "${release}" == "alpine" ]] && echo 1 || echo 0)"
+    } > "${dir}/backup.info"
+    cat > "${dir}/restore.sh" << 'RESTORE'
+#!/usr/bin/env bash
+# Puts back the program files and database saved by update.sh. Run as root.
+here="$(cd "$(dirname "$0")" && pwd)"
+source "${here}/backup.info"
+[[ $EUID -eq 0 ]] || { echo "Run this as root." >&2; exit 1; }
+
+echo "Stopping x-ui..."
+if [[ "${XUI_BK_OPENRC}" == "1" ]]; then
+    rc-service x-ui stop > /dev/null 2>&1
+else
+    systemctl stop x-ui > /dev/null 2>&1
+fi
+pkill -f 'mtg-linux-[^ ]* run ' > /dev/null 2>&1 || true
+pkill -f 'tuic-server.*-c .*bin/tuic/tuic_[0-9]+\.json' > /dev/null 2>&1 || true
+
+echo "Restoring the program files of x-ui ${XUI_BK_VERSION}..."
+tar -xzPf "${here}/install.tar.gz" || { echo "Could not unpack ${here}/install.tar.gz" >&2; exit 1; }
+
+if [[ "${XUI_BK_DB_TYPE}" == "sqlite" ]]; then
+    echo "Restoring the database..."
+    rm -f "${XUI_BK_DB_FOLDER}/x-ui.db" "${XUI_BK_DB_FOLDER}/x-ui.db-wal" "${XUI_BK_DB_FOLDER}/x-ui.db-shm"
+    for f in x-ui.db x-ui.db-wal x-ui.db-shm; do
+        [[ -f "${here}/${f}" ]] && cp -p "${here}/${f}" "${XUI_BK_DB_FOLDER}/${f}"
+    done
+else
+    echo "The PostgreSQL database is not part of this backup and was left as it is."
+fi
+
+if [[ "${XUI_BK_OPENRC}" == "1" ]]; then
+    rc-update add x-ui > /dev/null 2>&1
+    rc-service x-ui start > /dev/null 2>&1
+else
+    systemctl daemon-reload > /dev/null 2>&1
+    systemctl enable x-ui > /dev/null 2>&1
+    systemctl start x-ui > /dev/null 2>&1
+fi
+echo "Rolled back to x-ui ${XUI_BK_VERSION}."
+RESTORE
+    xui_backup_current="${dir}"
+    echo -e "${green}Saved the current version to ${dir}${plain}"
+}
+
+prune_backups() {
+    local root keep="${xui_backup_keep}"
+    root="$(xui_backup_root)"
+    [[ -d "${root}" ]] || return 0
+    [[ "${keep}" =~ ^[0-9]+$ && "${keep}" -ge 1 ]] || keep=3
+    find "${root}" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*-[0-9]*-*' 2> /dev/null |
+        sort -r | tail -n +$((keep + 1)) | while read -r old; do
+        rm -rf -- "${old}"
+    done
+}
+
+# Like _fail, but puts the previous version back first when a backup exists.
+_fail_with_rollback() {
+    local msg=${1}
+    if [[ -z "${xui_backup_current}" || ! -f "${xui_backup_current}/restore.sh" ]]; then
+        _fail "${msg}"
+    fi
+    echo -e "${red}${msg}${plain}"
+    echo -e "${yellow}Rolling back to the previous version...${plain}"
+    if bash "${xui_backup_current}/restore.sh"; then
+        _fail "ERROR: the update failed and the previous version ${current_xui_version:-unknown} was restored (backup: ${xui_backup_current})"
+    fi
+    _fail "ERROR: the update failed and the automatic rollback did not finish; run: bash ${xui_backup_current}/restore.sh"
+}
+
+# Active and still active a few seconds later; a unit that crashes on start flaps through "active".
+_xui_service_healthy() {
+    local waited=0 limit="${XUI_HEALTH_WAIT:-20}"
+    while [[ "${waited}" -lt "${limit}" ]]; do
+        if _xui_service_active; then
+            sleep "$((limit < 3 ? 1 : 3))"
+            _xui_service_active && return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+_xui_service_active() {
+    if [[ "${release}" == "alpine" ]]; then
+        rc-service x-ui status > /dev/null 2>&1
+    else
+        systemctl is-active --quiet x-ui
+    fi
+}
+
 update_x-ui() {
     cd ${xui_folder%/x-ui}/
 
@@ -596,6 +744,7 @@ update_x-ui() {
         # The new panel respawns a clean mtg per inbound on next start.
         pkill -f 'mtg-linux-[^ ]* run ' > /dev/null 2>&1 || true
         pkill -f 'tuic-server.*-c .*bin/tuic/tuic_[0-9]+\.json' > /dev/null 2>&1 || true
+        backup_current_install
         echo -e "${green}Removing old x-ui version...${plain}"
         rm ${xui_folder} -f > /dev/null 2>&1
         rm ${xui_folder}/x-ui.service -f > /dev/null 2>&1
@@ -622,12 +771,12 @@ update_x-ui() {
     tar zxvf x-ui-linux-$(arch).tar.gz > /dev/null 2>&1
     if [[ $? -ne 0 ]]; then
         rm x-ui-linux-$(arch).tar.gz -f > /dev/null 2>&1
-        _fail "ERROR: Failed to extract the x-ui release archive -- the previous installation has already been removed, so the panel will not start until this is fixed; try running the update again"
+        _fail_with_rollback "ERROR: Failed to extract the x-ui release archive -- the previous installation has already been removed, so the panel will not start until this is fixed; try running the update again"
     fi
     rm x-ui-linux-$(arch).tar.gz -f > /dev/null 2>&1
     cd x-ui > /dev/null 2>&1
     if [[ $? -ne 0 || ! -s x-ui ]]; then
-        _fail "ERROR: Extracted x-ui archive is missing the x-ui binary -- the previous installation has already been removed, so the panel will not start until this is fixed; try running the update again"
+        _fail_with_rollback "ERROR: Extracted x-ui archive is missing the x-ui binary -- the previous installation has already been removed, so the panel will not start until this is fixed; try running the update again"
     fi
     chmod +x x-ui > /dev/null 2>&1
 
@@ -651,7 +800,7 @@ update_x-ui() {
     fi
 
     echo -e "${green}Downloading and installing x-ui.sh script...${plain}"
-    local xui_script_temp="/usr/bin/x-ui-temp.$$"
+    local xui_script_temp="${xui_cmd}-temp.$$"
     rm -f "${xui_script_temp}"
     ${curl_bin} -fLRo "${xui_script_temp}" "https://raw.githubusercontent.com/iv7777/3x-ui/${script_ref}/x-ui.sh" > /dev/null 2>&1
     if [[ $? -ne 0 ]]; then
@@ -662,14 +811,14 @@ update_x-ui() {
         rm -f "${xui_script_temp}"
         _fail "ERROR: Downloaded x-ui.sh script is empty, please be sure that your server can access GitHub"
     fi
-    mv -f "${xui_script_temp}" /usr/bin/x-ui
+    mv -f "${xui_script_temp}" "${xui_cmd}"
     if [[ $? -ne 0 ]]; then
         rm -f "${xui_script_temp}"
         _fail "ERROR: Failed to install x-ui.sh script"
     fi
 
     chmod +x ${xui_folder}/x-ui.sh > /dev/null 2>&1
-    chmod +x /usr/bin/x-ui > /dev/null 2>&1
+    chmod +x "${xui_cmd}" > /dev/null 2>&1
     mkdir -p /var/log/x-ui > /dev/null 2>&1
 
     echo -e "${green}Changing owner...${plain}"
@@ -683,7 +832,9 @@ update_x-ui() {
     # Finish the schema/data migrations before the service starts, so the service and
     # config_after_update's CLI calls never run them on the same database at once (#6728).
     echo -e "${green}Migrating database...${plain}"
-    "${xui_folder}/x-ui" migrate
+    if ! "${xui_folder}/x-ui" migrate; then
+        _fail_with_rollback "ERROR: the new version could not migrate the database"
+    fi
 
     if [[ $release == "alpine" ]]; then
         echo -e "${green}Downloading and installing startup unit x-ui.rc...${plain}"
@@ -771,6 +922,11 @@ update_x-ui() {
         systemctl start x-ui > /dev/null 2>&1
     fi
 
+    echo -e "${green}Checking that the new version stays up...${plain}"
+    if ! _xui_service_healthy; then
+        _fail_with_rollback "ERROR: x-ui did not stay running after the update"
+    fi
+
     config_after_update
 
     # IP Limit relies on fail2ban; install + configure it now so the feature
@@ -778,7 +934,11 @@ update_x-ui() {
     # Never fatal.
     setup_fail2ban
 
+    prune_backups
     echo -e "${green}x-ui ${tag_version}${plain} updating finished, it is running now..."
+    if [[ -n "${xui_backup_current}" ]]; then
+        echo -e "${blue}Previous version saved in ${xui_backup_current}; undo the update with: x-ui rollback${plain}"
+    fi
     echo -e ""
     echo -e "┌───────────────────────────────────────────────────────┐
 │  ${blue}x-ui control menu usages (subcommands):${plain}              │
@@ -799,6 +959,9 @@ update_x-ui() {
 │  ${blue}x-ui uninstall${plain}    - Uninstall                        │
 └───────────────────────────────────────────────────────┘"
 }
+
+# deploy/test/update-rollback-test.sh sources this file to call the functions above.
+[[ "${XUI_UPDATE_LIB_ONLY:-}" == "1" ]] && return 0
 
 echo -e "${green}Running...${plain}"
 require_writable_update_paths

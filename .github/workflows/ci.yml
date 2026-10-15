@@ -9,6 +9,9 @@ on:
       - "frontend/**"
       - ".nvmrc"
       - "Makefile"
+      - "update.sh"
+      - "x-ui.sh"
+      - "deploy/**"
       - ".github/workflows/ci.yml"
   push:
     branches:
@@ -21,6 +24,9 @@ on:
       - "frontend/**"
       - ".nvmrc"
       - "Makefile"
+      - "update.sh"
+      - "x-ui.sh"
+      - "deploy/**"
       - ".github/workflows/ci.yml"
 
 permissions:
@@ -174,6 +180,15 @@ jobs:
         run: |
           go test -run '^$' -fuzz 'FuzzParseLink$' -fuzztime=30s ./internal/util/link/
           go test -run '^$' -fuzz 'FuzzDecodeCertPin$' -fuzztime=30s ./internal/web/runtime/
+
+  # Backup, rollback and health check of update.sh plus `x-ui rollback`, against a stubbed
+  # systemctl/curl tree. Root is needed because update.sh refuses to load without it.
+  update-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: update.sh backup and rollback
+        run: sudo bash deploy/test/update-rollback-test.sh
 
   golangci:
     runs-on: ubuntu-latest
