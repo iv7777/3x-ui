@@ -77,7 +77,10 @@ make_install() { # make_install <version tag>
 run_case() { # run_case <name> <function>; the body runs in a subshell so exit/_fail stay contained
     echo "== $1"
     ( # shellcheck disable=SC1091
+        set +u # update.sh reads optional variables such as XUI_UPDATE_PROXY unguarded
         source "$REPO_ROOT/update.sh" > /dev/null 2>&1
+        set -u
+        # shellcheck disable=SC2034 # read by the sourced update.sh functions
         current_xui_version="1.0.0"
         rm -rf "$(xui_backup_root)"
         "$2"
@@ -176,6 +179,7 @@ build_release() {
     fake_binary 9.9.9 "$1" > "$root/x-ui"
     echo "xray-new" > "$root/bin/xray-linux-$(arch)"
     echo "unit-new" > "$root/x-ui.service"
+    echo "new-management-script" > "$root/x-ui.sh"
     chmod +x "$root/x-ui" "$root/bin/xray-linux-$(arch)"
     tar -czf "$T/release.tar.gz" -C "$T/release" x-ui
     export STUB_TARBALL="$T/release.tar.gz"
@@ -202,6 +206,7 @@ case_update_succeeds() {
     run_update
     expect "update finishes" "0" "$?"
     expect "new binary is installed" "9.9.9" "$("$XUI_MAIN_FOLDER/x-ui" -v)"
+    expect "the management script comes from the archive" "new-management-script" "$(cat "$XUI_BIN_LINK")"
     expect "database is untouched" "db-old" "$(cat "$XUI_DB_FOLDER/x-ui.db")"
     expect "one backup of the old version is kept" "1" "$(find "$(xui_backup_root)" -mindepth 2 -name install.tar.gz | wc -l)"
 }

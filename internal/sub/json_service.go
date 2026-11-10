@@ -132,10 +132,12 @@ func (s *SubJsonService) GetJson(subId string, host string, alwaysReturnArray bo
 
 	var header string
 	var hasInactiveExternal bool
+	var hasBoundClosed bool
 	var hasEnabledClient bool
 
 	seenEmails := make(map[string]struct{})
 	entries := make([]subConfigEntry, 0, len(inbounds))
+	var ordered []orderedSubEntry[func() subConfigEntry]
 	// Prepare Inbounds
 	for _, inbound := range inbounds {
 		clients := subReq.matchingClients(inbound, subId)
@@ -149,8 +151,15 @@ func (s *SubJsonService) GetJson(subId string, host string, alwaysReturnArray bo
 			continue
 		}
 		subReq.projectThroughFallbackMaster(inbound)
-		if hostEps := subReq.hostEndpoints(inbound, "json"); len(hostEps) > 0 {
-			injectExternalProxy(inbound, hostEps)
+		var baseEps []map[string]any
+		baseStream := inbound.StreamSettings
+		// getConfig rewrites inbound.Listen/Port per endpoint while rendering a client, so bound
+		// endpoints resolve against this pre-loop snapshot.
+		baseInbound := *inbound
+		if !subReq.hostsFirst {
+			if baseEps = subReq.hostEndpoints(inbound, "json"); len(baseEps) > 0 {
+				injectExternalProxy(inbound, baseEps)
+			}
 		}
 
 		var inboundConfigs []json_util.RawMessage
@@ -159,7 +168,30 @@ func (s *SubJsonService) GetJson(subId string, host string, alwaysReturnArray bo
 				hasEnabledClient = true
 			}
 			seenEmails[client.Email] = struct{}{}
-			inboundConfigs = append(inboundConfigs, s.getConfig(subReq, inbound, client, host)...)
+			if subReq.hostsFirst {
+				variants, closed := subReq.clientHostVariants(&baseInbound, client, "json")
+				hasBoundClosed = hasBoundClosed || closed
+				for _, variant := range variants {
+					render := func() subConfigEntry {
+						configs := s.budgetedConfig(subReq, variant.inbound(subReq, inbound), client, host)
+						return subConfigEntry{sortIndex: inbound.SubSortIndex, id: inbound.Id, configs: configs, hostOrder: variant.order}
+					}
+					ordered = append(ordered, orderedSubEntry[func() subConfigEntry]{variant.order, render})
+				}
+				continue
+			}
+			effective := inbound
+			if effectiveEps, bound := subReq.clientHostEndpoints(&baseInbound, client, "json", baseEps); bound {
+				if len(effectiveEps) == 0 {
+					hasBoundClosed = true
+					continue
+				}
+				clone := baseInbound
+				clone.StreamSettings = baseStream
+				injectExternalProxy(&clone, effectiveEps)
+				effective = &clone
+			}
+			inboundConfigs = append(inboundConfigs, s.budgetedConfig(subReq, effective, client, host)...)
 		}
 		if len(inboundConfigs) > 0 {
 			entries = append(entries, subConfigEntry{
@@ -167,6 +199,14 @@ func (s *SubJsonService) GetJson(subId string, host string, alwaysReturnArray bo
 				id:        inbound.Id,
 				configs:   inboundConfigs,
 			})
+		}
+	}
+	if subReq.hostsFirst {
+		// Render in final endpoint order so first-link usage remarks stay first.
+		for _, render := range orderedSubValues(ordered) {
+			if entry := render(); len(entry.configs) > 0 {
+				entries = append(entries, entry)
+			}
 		}
 	}
 	entries = s.appendBalancerEntries(entries)
@@ -183,6 +223,23 @@ func (s *SubJsonService) GetJson(subId string, host string, alwaysReturnArray bo
 		return entries[i].id < entries[j].id
 	})
 	var configArray []json_util.RawMessage
+	if subReq.hostsFirst {
+		// Preserve balancer slots from the legacy sort; reorder endpoint slots only.
+		var endpoints []subConfigEntry
+		for _, entry := range entries {
+			if entry.kind == 0 {
+				endpoints = append(endpoints, entry)
+			}
+		}
+		sort.SliceStable(endpoints, func(i, j int) bool { return hostOrderLess(endpoints[i].hostOrder, endpoints[j].hostOrder) })
+		next := 0
+		for i := range entries {
+			if entries[i].kind == 0 {
+				entries[i] = endpoints[next]
+				next++
+			}
+		}
+	}
 	for _, entry := range entries {
 		configArray = append(configArray, entry.configs...)
 	}
@@ -211,12 +268,12 @@ func (s *SubJsonService) GetJson(subId string, host string, alwaysReturnArray bo
 			maps.Copy(newConfigJson, s.bakedTemplate())
 			newConfigJson["outbounds"] = newOutbounds
 			newConfigJson["remarks"] = remark
-			newConfig, _ := json.MarshalIndent(newConfigJson, "", "  ")
+			newConfig, _ := json.Marshal(newConfigJson)
 			configArray = append(configArray, newConfig)
 		}
 	}
 
-	if len(configArray) == 0 && !hasInactiveExternal {
+	if len(configArray) == 0 && !hasInactiveExternal && !hasBoundClosed {
 		return "", "", nil
 	}
 
@@ -255,6 +312,7 @@ func (s *SubJsonService) GetJson(subId string, host string, alwaysReturnArray bo
 // subConfigEntry is one ordered block of the JSON subscription: an inbound's
 // configs (kind 0) or a balancer config (kind 1).
 type subConfigEntry struct {
+	hostOrder *hostEntryOrder
 	sortIndex int
 	kind      int
 	id        int
@@ -473,6 +531,9 @@ func leastLoadCosts(balancer *model.SubBalancer, members []balMember) []any {
 func (s *SubJsonService) buildBalancerConfig(balancer *model.SubBalancer, entries []subConfigEntry, entryProxies [][]map[string]any) json_util.RawMessage {
 	prefix := fmt.Sprintf("bal-%d-", balancer.Id)
 	usedTags := make(map[string]bool)
+	// Next suffix to try per base: tags are only ever added, so every lower one
+	// is taken and resuming there keeps a node-sized member list linear.
+	nextSuffix := make(map[string]int)
 	var proxies []json_util.RawMessage
 	// Members in emission order with their owning inbound, so costs[] can
 	// reference the exact retagged tags assigned here.
@@ -488,9 +549,11 @@ func (s *SubJsonService) buildBalancerConfig(balancer *model.SubBalancer, entrie
 			protocol, _ := outbound["protocol"].(string)
 			base := prefix + balancerMemberSuffix(protocol)
 			tag := base
-			for suffix := 2; usedTags[tag]; suffix++ {
+			suffix := max(nextSuffix[base], 2)
+			for ; usedTags[tag]; suffix++ {
 				tag = fmt.Sprintf("%s-%d", base, suffix)
 			}
+			nextSuffix[base] = suffix
 			usedTags[tag] = true
 			member := maps.Clone(outbound)
 			member["tag"] = tag
@@ -638,6 +701,13 @@ func (s *SubJsonService) getConfig(subReq *SubService, inbound *model.Inbound, c
 			liftHostTLSVerification(newStream)
 		}
 		applyHostStreamOverrides(extPrxy, newStream)
+		if tlsSettings, ok := newStream["tlsSettings"].(map[string]any); ok && security == "tls" {
+			cs, _ := tlsSettings["cipherSuites"].(string)
+			fp, _ := tlsSettings["fingerprint"].(string)
+			if pinned := fingerprintForCipherSuites(fp, cs); pinned != fp {
+				tlsSettings["fingerprint"] = pinned
+			}
+		}
 		if finalmask, ok := newStream["finalmask"].(map[string]any); ok {
 			newStream["finalmask"] = withLegacyFragmentRanges(finalmask)
 		}
@@ -666,11 +736,11 @@ func (s *SubJsonService) getConfig(subReq *SubService, inbound *model.Inbound, c
 		case "trojan", "shadowsocks":
 			newOutbounds = append(newOutbounds, s.genServer(subReq, inbound, streamSettings, client, jsonMux(mux, hostMux)))
 		case "hysteria":
-			newOutbounds = append(newOutbounds, s.genHy(inbound, newStream, client, jsonMux(mux, hostMux)))
+			newOutbounds = append(newOutbounds, s.genHy(subReq, inbound, newStream, client, jsonMux(mux, hostMux)))
 		case "masque":
 			newOutbounds = append(newOutbounds, s.genMasque(inbound, newStream, client))
 		case "wireguard":
-			wgOutbound := s.genWireguard(inbound, client)
+			wgOutbound := s.genWireguard(subReq, inbound, client)
 			if wgOutbound == nil {
 				continue
 			}
@@ -715,6 +785,7 @@ func (s *SubJsonService) streamData(stream string, clientKey string) map[string]
 		}
 	}
 	delete(streamSettings, "sockopt")
+	dropServerOnlyFinalMasks(streamSettings["finalmask"])
 
 	// The inbound's own hop range becomes a mask first, so the global default yields to it.
 	maskcompat.UpgradeLegacyUDPHop(streamSettings["finalmask"])
@@ -738,6 +809,7 @@ func (s *SubJsonService) streamData(stream string, clientKey string) map[string]
 			delete(xhttp, "scMaxBufferedPosts")
 			delete(xhttp, "scStreamUpServerSecs")
 			delete(xhttp, "serverMaxHeaderBytes")
+			delete(xhttp, "h2Params")
 			// Values matching xray-core's own defaults stay off the wire:
 			// old panels seeded them into every stored config and the
 			// literal scMinPostsIntervalMs=30 is a DPI fingerprint (#5141).
@@ -971,7 +1043,7 @@ func (s *SubJsonService) genServer(subReq *SubService, inbound *model.Inbound, s
 	return result
 }
 
-func (s *SubJsonService) genHy(inbound *model.Inbound, newStream map[string]any, client model.Client, mux string) json_util.RawMessage {
+func (s *SubJsonService) genHy(subReq *SubService, inbound *model.Inbound, newStream map[string]any, client model.Client, mux string) json_util.RawMessage {
 	outbound := Outbound{
 		Protocol: string(inbound.Protocol),
 		Tag:      "proxy",
@@ -981,9 +1053,8 @@ func (s *SubJsonService) genHy(inbound *model.Inbound, newStream map[string]any,
 		outbound.Mux = json_util.RawMessage(mux)
 	}
 
-	var settings, stream map[string]any
-	_ = json.Unmarshal([]byte(inbound.Settings), &settings)
-	version, _ := settings["version"].(float64)
+	var stream map[string]any
+	version, _ := subReq.linkSettings(inbound)["version"].(float64)
 	outbound.Settings = map[string]any{
 		"version": int(version),
 		"address": inbound.Listen,
@@ -1049,13 +1120,12 @@ func (s *SubJsonService) genMasque(inbound *model.Inbound, newStream map[string]
 // mirroring genWireguardLink: the peer public key is derived from the inbound
 // secretKey, the client owns the private key / tunnel address / pre-shared key,
 // and the peer routes the full tunnel. Returns nil when the client has no key.
-func (s *SubJsonService) genWireguard(inbound *model.Inbound, client model.Client) json_util.RawMessage {
+func (s *SubJsonService) genWireguard(subReq *SubService, inbound *model.Inbound, client model.Client) json_util.RawMessage {
 	if client.PrivateKey == "" {
 		return nil
 	}
 
-	var inboundSettings map[string]any
-	_ = json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
+	inboundSettings := subReq.linkSettings(inbound)
 	secretKey, _ := inboundSettings["secretKey"].(string)
 
 	peer := map[string]any{

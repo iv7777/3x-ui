@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
+	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 )
 
 const settleTimeout = 30 * time.Second
@@ -194,6 +195,49 @@ func (p *panel) deleteInboundRow(id int) {
 			p.t.Fatalf("%s: %s: %v", p.name, q, err)
 		}
 	}
+}
+
+func (p *panel) setClientTrafficHome(email string, inboundID int) {
+	p.t.Helper()
+	if p.cmd != nil {
+		p.t.Fatalf("%s: setClientTrafficHome on a running panel", p.name)
+	}
+	sharedDBMu.Lock()
+	defer sharedDBMu.Unlock()
+	if err := database.InitDB(filepath.Join(p.dir, "db", "x-ui.db")); err != nil {
+		p.t.Fatalf("%s: open db: %v", p.name, err)
+	}
+	defer func() { _ = database.CloseDB() }()
+	result := database.GetDB().Table("client_traffics").Where("email = ?", email).Update("inbound_id", inboundID)
+	if result.Error != nil || result.RowsAffected != 1 {
+		p.t.Fatalf("%s: set traffic home: rows=%d error=%v", p.name, result.RowsAffected, result.Error)
+	}
+}
+
+func (p *panel) seedClientIpAttribution(email, ips string) string {
+	p.t.Helper()
+	if p.cmd != nil {
+		p.t.Fatalf("%s: seedClientIpAttribution on a running panel", p.name)
+	}
+	sharedDBMu.Lock()
+	defer sharedDBMu.Unlock()
+	if err := database.InitDB(filepath.Join(p.dir, "db", "x-ui.db")); err != nil {
+		p.t.Fatalf("%s: open db: %v", p.name, err)
+	}
+	defer func() { _ = database.CloseDB() }()
+	db := database.GetDB()
+	var setting model.Setting
+	if err := db.Where("key = ?", "panelGuid").First(&setting).Error; err != nil {
+		p.t.Fatalf("%s: read panelGuid: %v", p.name, err)
+	}
+	if setting.Value == "" {
+		p.t.Fatalf("%s: empty panelGuid", p.name)
+	}
+	row := model.NodeClientIp{NodeGuid: setting.Value, Email: email, Ips: ips}
+	if err := db.Create(&row).Error; err != nil {
+		p.t.Fatalf("%s: seed attribution: %v", p.name, err)
+	}
+	return setting.Value
 }
 
 func (p *panel) url() string { return "http://127.0.0.1:" + strconv.Itoa(p.port) }

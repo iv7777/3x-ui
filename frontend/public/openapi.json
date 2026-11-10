@@ -3,7 +3,7 @@
   "info": {
     "title": "3X-UI Panel API",
     "version": "3.x",
-    "description": "Programmatic interface to a 3X-UI panel. Authenticate either by logging in (cookie) or with an API token from Settings → Security → API Token (Bearer). All endpoints under /panel/api/* honour both modes — an API token is a full-admin credential, so treat it like the panel password."
+    "description": "Programmatic interface to a 3X-UI panel. Authenticate either by logging in (cookie) or with a scoped API token from Settings → Security → API Token (Bearer). Token access is limited by its admin, monitor, node-sync, or node-admin scope; treat admin tokens like the panel password."
   },
   "servers": [
     {
@@ -16,7 +16,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "API token from Settings → Security → API Token. Send as `Authorization: Bearer <token>`."
+        "description": "Scoped API token from Settings → Security → API Token. Send as `Authorization: Bearer <token>`."
       },
       "cookieAuth": {
         "type": "apiKey",
@@ -152,6 +152,11 @@
           "ldapVlessField": {
             "type": "string"
           },
+          "nodeDownThreshold": {
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
           "outboundDownThreshold": {
             "maximum": 100,
             "minimum": 1,
@@ -241,6 +246,9 @@
           },
           "subClashPath": {
             "type": "string"
+          },
+          "subClashRemoteDNS": {
+            "type": "boolean"
           },
           "subClashRules": {
             "type": "string"
@@ -341,6 +349,10 @@
           },
           "subHideSettings": {
             "type": "boolean"
+          },
+          "subHostSortMode": {
+            "example": "inbound-first",
+            "type": "string"
           },
           "subIncyAnnounceUrl": {
             "type": "string"
@@ -636,6 +648,7 @@
           "ldapUserAttr",
           "ldapUserFilter",
           "ldapVlessField",
+          "nodeDownThreshold",
           "outboundDownThreshold",
           "pageSize",
           "panelOutbound",
@@ -662,6 +675,7 @@
           "subClashEnable",
           "subClashEnableRouting",
           "subClashPath",
+          "subClashRemoteDNS",
           "subClashRules",
           "subClashURI",
           "subClashUserAgentRegex",
@@ -695,6 +709,7 @@
           "subHappTunMode",
           "subHappTunType",
           "subHideSettings",
+          "subHostSortMode",
           "subIncyAnnounceUrl",
           "subIncyAppAutoDetect",
           "subIncyBannerBgColor",
@@ -928,6 +943,11 @@
           "ldapVlessField": {
             "type": "string"
           },
+          "nodeDownThreshold": {
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
           "outboundDownThreshold": {
             "maximum": 100,
             "minimum": 1,
@@ -1017,6 +1037,9 @@
           },
           "subClashPath": {
             "type": "string"
+          },
+          "subClashRemoteDNS": {
+            "type": "boolean"
           },
           "subClashRules": {
             "type": "string"
@@ -1117,6 +1140,10 @@
           },
           "subHideSettings": {
             "type": "boolean"
+          },
+          "subHostSortMode": {
+            "example": "inbound-first",
+            "type": "string"
           },
           "subIncyAnnounceUrl": {
             "type": "string"
@@ -1420,6 +1447,7 @@
           "ldapUserAttr",
           "ldapUserFilter",
           "ldapVlessField",
+          "nodeDownThreshold",
           "outboundDownThreshold",
           "pageSize",
           "panelOutbound",
@@ -1446,6 +1474,7 @@
           "subClashEnable",
           "subClashEnableRouting",
           "subClashPath",
+          "subClashRemoteDNS",
           "subClashRules",
           "subClashURI",
           "subClashUserAgentRegex",
@@ -1479,6 +1508,7 @@
           "subHappTunMode",
           "subHappTunType",
           "subHideSettings",
+          "subHostSortMode",
           "subIncyAnnounceUrl",
           "subIncyAppAutoDetect",
           "subIncyBannerBgColor",
@@ -1673,6 +1703,23 @@
         ],
         "type": "object"
       },
+      "Blocker": {
+        "description": "Blocker is one unmet requirement.",
+        "properties": {
+          "code": {
+            "example": "tools",
+            "type": "string"
+          },
+          "detail": {
+            "example": "awg",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
       "Client": {
         "description": "Client represents a client configuration for Xray inbounds with traffic limits and settings.",
         "properties": {
@@ -1699,6 +1746,17 @@
           "auth": {
             "description": "Auth password (Hysteria)",
             "type": "string"
+          },
+          "clientHostRuleIds": {
+            "description": "ClientHostRuleIds binds the client to these host rules, one link each; nil preserves, empty\nclears, and bindings with no usable host leave that inbound out of the subscription.",
+            "example": [
+              1,
+              2
+            ],
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
           },
           "comment": {
             "description": "Client comment",
@@ -1727,7 +1785,8 @@
             "type": "string"
           },
           "forwardedPorts": {
-            "description": "AmneziaWG per-client port-forwarding spec, e.g. \"80,443,8000-8100\"",
+            "description": "AmneziaWG port-forwarding spec, e.g. \"80,443,8000-8100\"; \"\" withdraws the forwards, omit to keep them",
+            "nullable": true,
             "type": "string"
           },
           "group": {
@@ -1739,9 +1798,15 @@
             "type": "string"
           },
           "keepAlive": {
-            "description": "Seconds between PersistentKeepalive packets; 0 sends none, omit to keep the stored value",
-            "nullable": true,
-            "type": "integer"
+            "description": "Numeric values or AmneziaWG ranges; 0 disables, omission preserves.",
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              }
+            ]
           },
           "limitIp": {
             "description": "IP limit for this client",
@@ -1931,6 +1996,16 @@
           "auth": {
             "type": "string"
           },
+          "clientHostRuleIds": {
+            "example": [
+              1,
+              2
+            ],
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
           "comment": {
             "type": "string"
           },
@@ -1961,7 +2036,15 @@
             "type": "integer"
           },
           "keepAlive": {
-            "type": "integer"
+            "description": "Numeric values or AmneziaWG ranges.",
+            "oneOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              }
+            ]
           },
           "limitHwid": {
             "type": "integer"
@@ -2763,6 +2846,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "randomCount": {
+            "example": 1,
+            "type": "integer"
+          },
           "remark": {
             "example": "cdn-front",
             "maxLength": 256,
@@ -2787,6 +2874,15 @@
           },
           "sni": {
             "type": "string"
+          },
+          "sniSharedRandom": {
+            "type": "boolean"
+          },
+          "snis": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "sockoptParams": {},
           "sortOrder": {
@@ -2835,11 +2931,13 @@
           "path",
           "pinnedPeerCertSha256",
           "port",
+          "randomCount",
           "remark",
           "security",
           "serverDescription",
           "shuffleHost",
           "sni",
+          "sniSharedRandom",
           "sockoptParams",
           "sortOrder",
           "tags",
@@ -2944,6 +3042,11 @@
             "minimum": 0,
             "type": "integer"
           },
+          "randomCount": {
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
           "remark": {
             "maxLength": 256,
             "type": "string"
@@ -2966,6 +3069,15 @@
           },
           "sni": {
             "type": "string"
+          },
+          "sniSharedRandom": {
+            "type": "boolean"
+          },
+          "snis": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "sockoptParams": {
             "type": "string"
@@ -3009,11 +3121,14 @@
           "path",
           "pinnedPeerCertSha256",
           "port",
+          "randomCount",
           "remark",
           "security",
           "serverDescription",
           "shuffleHost",
           "sni",
+          "sniSharedRandom",
+          "snis",
           "sockoptParams",
           "sortOrder",
           "tags",
@@ -3697,6 +3812,13 @@
           "transitive": {
             "type": "boolean"
           },
+          "unavailableMetrics": {
+            "description": "Nil on legacy rows and responses: zero remains a valid measured value.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "updatedAt": {
             "example": 1700000000,
             "format": "int64",
@@ -4005,6 +4127,12 @@
             "example": false,
             "type": "boolean"
           },
+          "unavailableMetrics": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "updatedAt": {
             "example": 1700003600,
             "format": "int64",
@@ -4217,6 +4345,12 @@
             "example": "online",
             "type": "string"
           },
+          "unavailableMetrics": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "uptimeSecs": {
             "example": 86400,
             "format": "int64",
@@ -4245,6 +4379,37 @@
           "xrayError",
           "xrayState",
           "xrayVersion"
+        ],
+        "type": "object"
+      },
+      "Readiness": {
+        "description": "Readiness is the host's ability to run any kernel-mode inbound at all.",
+        "properties": {
+          "blockers": {
+            "example": [
+              {
+                "code": "tools",
+                "detail": "awg"
+              }
+            ],
+            "items": {
+              "$ref": "#/components/schemas/Blocker"
+            },
+            "type": "array"
+          },
+          "installCommand": {
+            "example": "sudo /usr/local/x-ui/x-ui install-awg-kernel",
+            "type": "string"
+          },
+          "ready": {
+            "example": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "blockers",
+          "installCommand",
+          "ready"
         ],
         "type": "object"
       },
@@ -4430,6 +4595,10 @@
           "keepaliveTimeout": {
             "type": "string"
           },
+          "kernelMode": {
+            "description": "KernelMode runs this inbound on the AmneziaWG kernel module (internal/amneziawgkern)\ninstead of the embedded amneziawg-go + gVisor stack.",
+            "type": "boolean"
+          },
           "maxHandshakeAttempts": {
             "type": "string"
           },
@@ -4597,6 +4766,35 @@
           "sortOrder",
           "strategy",
           "updatedAt"
+        ],
+        "type": "object"
+      },
+      "TgBotCapabilities": {
+        "description": "TgBotCapabilities is the browser-safe shape of the bot's own capabilities.",
+        "properties": {
+          "groupPrivacy": {
+            "description": "GroupPrivacy off means the bot reads every group message; when it is on,\na bare /start in a group is invisible to the bot.",
+            "example": false,
+            "type": "boolean"
+          },
+          "inlineEnabled": {
+            "example": true,
+            "type": "boolean"
+          },
+          "running": {
+            "example": true,
+            "type": "boolean"
+          },
+          "username": {
+            "example": "xui_bot",
+            "type": "string"
+          }
+        },
+        "required": [
+          "groupPrivacy",
+          "inlineEnabled",
+          "running",
+          "username"
         ],
         "type": "object"
       },
@@ -4804,7 +5002,7 @@
     },
     {
       "name": "API Tokens",
-      "description": "Manage scoped Bearer tokens for programmatic auth. Tokens grant admin, monitor, or node-sync access, may expire, and are stored as SHA-256 hashes. The plaintext is returned only once at creation."
+      "description": "Manage scoped Bearer tokens for programmatic auth. admin grants the full panel API; monitor is read-only for status and metrics; node-sync manages node configuration without panel updates; node-admin adds panel self-update to node-sync. Tokens may expire and are stored as SHA-256 hashes. The plaintext is returned only once at creation."
     },
     {
       "name": "Xray Settings",
@@ -5215,6 +5413,51 @@
         }
       }
     },
+    "/panel/api/inbounds/amneziawgKernelReadiness": {
+      "get": {
+        "tags": [
+          "Inbounds"
+        ],
+        "summary": "Whether this host can run an AmneziaWG inbound on the kernel module. Returns ready, host blocker codes (root/tools/module/nft), and the command that fixes them. Saving an inbound also checks its features and rejects IPv6, port forwarding, routeThroughXray, or a pinned listen address that the kernel backend cannot honor.",
+        "operationId": "get_panel_api_inbounds_amneziawgKernelReadiness",
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "msg": {
+                      "type": "string"
+                    },
+                    "obj": {
+                      "$ref": "#/components/schemas/Readiness"
+                    }
+                  }
+                },
+                "example": {
+                  "success": true,
+                  "obj": {
+                    "blockers": [
+                      {
+                        "code": "tools",
+                        "detail": "awg"
+                      }
+                    ],
+                    "installCommand": "sudo /usr/local/x-ui/x-ui install-awg-kernel",
+                    "ready": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/panel/api/inbounds/allLinks": {
       "get": {
         "tags": [
@@ -5304,7 +5547,7 @@
         "tags": [
           "Inbounds"
         ],
-        "summary": "Create a new inbound. Send the full inbound payload (protocol, port, settings, streamSettings, sniffing, remark, expiryTime, total, enable). settings, streamSettings, and sniffing may be sent as nested JSON objects (preferred) or as JSON-encoded strings (legacy).",
+        "summary": "Create a new inbound. Send the full inbound payload (protocol, port, settings, streamSettings, sniffing, remark, expiryTime, total, enable). settings, streamSettings, and sniffing may be sent as nested JSON objects (preferred) or as JSON-encoded strings (legacy). VLESS empty fallback arrays are normalized away; nonempty fallbacks cannot be combined with active server decryption.",
         "operationId": "post_panel_api_inbounds_add",
         "requestBody": {
           "required": true,
@@ -5328,8 +5571,7 @@
                       "email": "user1"
                     }
                   ],
-                  "decryption": "none",
-                  "fallbacks": []
+                  "decryption": "none"
                 },
                 "streamSettings": {
                   "network": "tcp",
@@ -5500,7 +5742,7 @@
         "tags": [
           "Inbounds"
         ],
-        "summary": "Replace an inbound’s configuration. Body shape mirrors /add, but the inbound keeps its stored client list and enable flag: settings.clients and enable in the body are ignored. Manage clients through the /panel/api/clients endpoints and toggle the inbound with /setEnable.",
+        "summary": "Replace an inbound’s configuration. Body shape mirrors /add, but the inbound keeps its stored client list and enable flag: settings.clients and enable in the body are ignored. Manage clients through the /panel/api/clients endpoints and toggle the inbound with /setEnable. Remove effective fallback rules before enabling VLESS server decryption.",
         "operationId": "post_panel_api_inbounds_update_id",
         "parameters": [
           {
@@ -5535,8 +5777,7 @@
                       "email": "user1"
                     }
                   ],
-                  "decryption": "none",
-                  "fallbacks": []
+                  "decryption": "none"
                 },
                 "streamSettings": {
                   "network": "tcp",
@@ -5811,7 +6052,7 @@
         "tags": [
           "Inbounds"
         ],
-        "summary": "Bulk-import an inbound from a JSON blob (e.g. one exported via the UI). The body uses form encoding with a single \"data\" field.",
+        "summary": "Bulk-import an inbound from a JSON blob (e.g. one exported via the UI). The body uses form encoding with a single \"data\" field. VLESS fallback validation is identical to /add.",
         "operationId": "post_panel_api_inbounds_import",
         "requestBody": {
           "required": true,
@@ -5985,7 +6226,7 @@
         "tags": [
           "Inbounds"
         ],
-        "summary": "Replace the entire fallback list for a master inbound. Body is JSON. Triggers an Xray restart.",
+        "summary": "Replace the entire fallback list for a master inbound. Body is JSON. Nonempty lists require TCP with TLS/REALITY and no active VLESS server decryption. An empty list can remove rules even from an incompatible inbound. Triggers an Xray restart.",
         "operationId": "post_panel_api_inbounds_id_fallbacks",
         "parameters": [
           {
@@ -7080,7 +7321,7 @@
         "tags": [
           "Server"
         ],
-        "summary": "Self-update the panel to the latest version. The server restarts on success.",
+        "summary": "Self-update the panel to the latest version. The server restarts on success. Bearer-token callers need admin or node-admin scope.",
         "operationId": "post_panel_api_server_updatePanel",
         "requestBody": {
           "required": false,
@@ -8377,6 +8618,123 @@
         }
       }
     },
+    "/panel/api/clients/get": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "Fetch one client by email, including the inbound IDs and external config IDs it is attached to.",
+        "operationId": "get_panel_api_clients_get",
+        "description": "Query-parameter alias for the path endpoint. Use email=. or email=.. to manage legacy reserved names without URL dot-segment normalization.",
+        "parameters": [
+          {
+            "name": "email",
+            "in": "query",
+            "required": true,
+            "description": "Client email (unique identifier).",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "msg": {
+                      "type": "string"
+                    },
+                    "obj": {}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/panel/api/clients/get/subId/{subId}": {
+      "get": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "Fetch clients by subscription ID.",
+        "operationId": "get_panel_api_clients_get_subId_subId",
+        "description": "Matches the exact subscription ID and orders results by client ID. Returns an array of the same payloads as GET /clients/get/:email, since multiple clients can share a subscription ID. Includes disabled, expired and unattached clients. An unknown ID returns HTTP 200 with success:false, obj:null and a record-not-found message, matching the email lookup. Requires an admin token or a panel login session.",
+        "parameters": [
+          {
+            "name": "subId",
+            "in": "path",
+            "required": true,
+            "description": "Exact subscription ID (URL-encoded).",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "msg": {
+                      "type": "string"
+                    },
+                    "obj": {
+                      "type": "array",
+                      "nullable": true,
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "client": {
+                            "$ref": "#/components/schemas/ClientRecord"
+                          },
+                          "inboundIds": {
+                            "type": "array",
+                            "items": {
+                              "type": "integer"
+                            }
+                          },
+                          "externalLinks": {
+                            "type": "array",
+                            "items": {
+                              "type": "object"
+                            }
+                          },
+                          "usedTraffic": {
+                            "type": "integer",
+                            "format": "int64"
+                          },
+                          "tunnelAllowedIPs": {
+                            "type": "object",
+                            "additionalProperties": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/panel/api/clients/get/tgId/{tgId}": {
       "get": {
         "tags": [
@@ -8425,7 +8783,7 @@
         ],
         "summary": "Create a new client and attach it to one or more inbounds in a single call. Body is JSON. Per-protocol secrets are generated server-side when omitted, so callers can send only the universal fields.",
         "operationId": "post_panel_api_clients_add",
-        "description": "Fields the server fills in when they are omitted — a valid value sent by the caller is never overwritten. Re-adding an email that already exists, with its stored `subId`, reuses the stored `id`, `password`, `auth` and `secret` instead of minting new ones, so the identity stays in sync across its inbounds.\n\n- **VLESS / VMess** — `id`, a fresh UUID\n- **Trojan** — `password`\n- **Shadowsocks** — `password`. On a `2022-blake3-*` inbound a supplied password that does not base64-decode to the key length of the cipher (16 or 32 bytes) is replaced by a generated key and the call still succeeds, so read the client back if you did not let the server pick. Legacy ciphers keep any non-empty password\n- **Hysteria** — `auth`\n- **mtproto** — `secret`, a FakeTLS secret derived from the fronting domain of the inbound, or from `www.cloudflare.com` when it has none\n- **WireGuard** — `privateKey` and `publicKey` when both are blank, or `publicKey` alone when only a `privateKey` was sent, plus `allowedIPs`: one free `/32` taken from the /24 the existing peers of that inbound already sit in, or from `10.0.0.0/24` when it has none\n\nAccepted on the same body but never generated: `preSharedKey` and `keepAlive` (WireGuard), `adTag` (mtproto).\n\nWireGuard is the only one of these that can fail. Allocation widens the search to the containing /16 before giving up with `inbound <id>: wireguard: no free address available in <scope>`, and an `allowedIPs` supplied by the caller is validated instead of allocated: `inbound <id>: wireguard: allowedIPs entry <entry> overlaps <address> used by another client` when its range overlaps an address or prefix a different client of that same inbound holds, or `... used by a client on <inbound>` when the holder sits on another WireGuard or AmneziaWG inbound. Ranges are compared, not strings, so `10.0.0.9/24` collides with `10.0.0.5/32`; a `0.0.0.0/0` or `::/0` default route claims no address. Allocation likewise skips every address inside a prefix another client holds. The same validation runs on POST /panel/api/clients/{email}/attach, where a client that already carries an address brings it along.\n\nAn `inboundIds` entry that names no existing inbound rejects the whole call before anything is written. Past that, the inbounds are applied concurrently and independently: one that fails no longer stops the others, so a `success:false` response can still have created the client on the rest. Every error names the inbound it came from (`inbound 7: <message>`), and several failures are reported together, one per line. `limitHwid` is applied only when every inbound succeeded, so re-run the call after fixing the failure.",
+        "description": "Client email must not be exactly `.` or `..`. Existing reserved-name clients can be read, renamed to a valid name, or deleted using the query-parameter /get, /update and /del aliases. Fields the server fills in when they are omitted — a valid value sent by the caller is never overwritten. Re-adding an email that already exists, with its stored `subId`, reuses the stored `id`, `password`, `auth` and `secret` instead of minting new ones, so the identity stays in sync across its inbounds.\n\n- **VLESS / VMess** — `id`, a fresh UUID\n- **Trojan** — `password`\n- **Shadowsocks** — `password`. On a `2022-blake3-*` inbound a supplied password that does not base64-decode to the key length of the cipher (16 or 32 bytes) is replaced by a generated key and the call still succeeds, so read the client back if you did not let the server pick. Legacy ciphers keep any non-empty password\n- **Hysteria** — `auth`\n- **mtproto** — `secret`, a FakeTLS secret derived from the fronting domain of the inbound, or from `www.cloudflare.com` when it has none\n- **WireGuard** — `privateKey` and `publicKey` when both are blank, or `publicKey` alone when only a `privateKey` was sent, plus `allowedIPs`: one free `/32` taken from the /24 the existing peers of that inbound already sit in, or from `10.0.0.0/24` when it has none\n\nAccepted on the same body but never generated: `preSharedKey` and `keepAlive` (WireGuard), `adTag` (mtproto).\n\nWireGuard is the only one of these that can fail. Allocation widens the search to the containing /16 before giving up with `inbound <id>: wireguard: no free address available in <scope>`, and an `allowedIPs` supplied by the caller is validated instead of allocated: `inbound <id>: wireguard: allowedIPs entry <entry> overlaps <address> used by another client` when its range overlaps an address or prefix a different client of that same inbound holds, or `... used by a client on <inbound>` when the holder sits on another WireGuard or AmneziaWG inbound. Ranges are compared, not strings, so `10.0.0.9/24` collides with `10.0.0.5/32`; a `/0` entry collides with every address of its family another client holds, and only a `0.0.0.0/0` or `::/0` default route that is already stored (legacy peers) keeps nobody out. Allocation likewise skips every address inside a prefix another client holds. The same validation runs on POST /panel/api/clients/{email}/attach, where a client that already carries an address brings it along.\n\nAn `inboundIds` entry that names no existing inbound rejects the whole call before anything is written. Past that, the inbounds are applied concurrently and independently: one that fails no longer stops the others, so a `success:false` response can still have created the client on the rest. Every error names the inbound it came from (`inbound 7: <message>`), and several failures are reported together, one per line. `limitHwid` is applied only when every inbound succeeded, so re-run the call after fixing the failure.",
         "requestBody": {
           "required": true,
           "content": {
@@ -8591,13 +8949,77 @@
         "tags": [
           "Clients"
         ],
-        "summary": "Update an existing client by email. Changes propagate to every attached inbound. Body is the JSON client payload — supply the full set of fields you want to keep (the server replaces the row, it does not patch).",
+        "summary": "Update an existing client by email. Changes propagate to every attached inbound. Body is the JSON client payload: omitted fields keep their current values, and an explicit zero, empty or null value clears a field, except as noted below.",
         "operationId": "post_panel_api_clients_update_email",
-        "description": "The inbounds are applied concurrently and independently: one that fails no longer stops the others. Every inbound error names the inbound it came from (`inbound 7: <message>`), and several failures are reported together, one per line. So a `success:false` response can still have applied the edit to the remaining inbounds. The client record is written after the inbounds, so a failure there is reported without an `inbound <id>:` prefix and leaves the inbound edits in place.",
+        "description": "An omitted `flow` leaves every attached inbound on its own flow. Send `\"reverse\": null` to remove the reverse tag. Credentials (`id`, `password`, `auth`, `secret`, `subId`) and WireGuard/AmneziaWG `allowedIPs` are never cleared: an empty value keeps the stored one. The inbounds are applied concurrently and independently: one that fails no longer stops the others. Every inbound error names the inbound it came from (`inbound 7: <message>`), and several failures are reported together, one per line. So a `success:false` response can still have applied the edit to the remaining inbounds. The client record is written after the inbounds, so a failure there is reported without an `inbound <id>:` prefix and leaves the inbound edits in place.",
         "parameters": [
           {
             "name": "email",
             "in": "path",
+            "required": true,
+            "description": "Current client email (unique identifier).",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              },
+              "example": {
+                "email": "alice@example.com",
+                "totalGB": 107374182400,
+                "expiryTime": 1767225600000,
+                "limitHwid": 2,
+                "tgId": 123456789,
+                "enable": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "msg": {
+                      "type": "string"
+                    },
+                    "obj": {}
+                  }
+                },
+                "example": {
+                  "success": true,
+                  "msg": "Client updated"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/panel/api/clients/update": {
+      "post": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "Update an existing client by email. Changes propagate to every attached inbound. Body is the JSON client payload: omitted fields keep their current values, and an explicit zero, empty or null value clears a field, except as noted below.",
+        "operationId": "post_panel_api_clients_update",
+        "description": "Query-parameter alias for the path endpoint. Use email=. or email=.. to manage legacy reserved names without URL dot-segment normalization. An omitted `flow` leaves every attached inbound on its own flow. Send `\"reverse\": null` to remove the reverse tag. Credentials (`id`, `password`, `auth`, `secret`, `subId`) and WireGuard/AmneziaWG `allowedIPs` are never cleared: an empty value keeps the stored one. The inbounds are applied concurrently and independently: one that fails no longer stops the others. Every inbound error names the inbound it came from (`inbound 7: <message>`), and several failures are reported together, one per line. So a `success:false` response can still have applied the edit to the remaining inbounds. The client record is written after the inbounds, so a failure there is reported without an `inbound <id>:` prefix and leaves the inbound edits in place.",
+        "parameters": [
+          {
+            "name": "email",
+            "in": "query",
             "required": true,
             "description": "Current client email (unique identifier).",
             "schema": {
@@ -8662,6 +9084,61 @@
           {
             "name": "email",
             "in": "path",
+            "required": true,
+            "description": "Client email (unique identifier).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "keepTraffic",
+            "in": "query",
+            "required": true,
+            "description": "Pass 1 to retain the xray_client_traffic row after deletion.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "msg": {
+                      "type": "string"
+                    },
+                    "obj": {}
+                  }
+                },
+                "example": {
+                  "success": true,
+                  "msg": "Client deleted"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/panel/api/clients/del": {
+      "post": {
+        "tags": [
+          "Clients"
+        ],
+        "summary": "Delete a client by email. Removes it from every attached inbound and drops its traffic record unless keepTraffic=1 is passed.",
+        "operationId": "post_panel_api_clients_del",
+        "description": "Query-parameter alias for the path endpoint. Use email=. or email=.. to manage legacy reserved names without URL dot-segment normalization. The inbounds are applied concurrently and independently: one that fails no longer stops the others. Every inbound error names the inbound it came from (`inbound 7: <message>`), and several failures are reported together, one per line. So a `success:false` response can still have removed the client from the remaining inbounds; the client record is kept in that case, so re-running the call retries exactly the leftovers. The record and traffic rows are dropped after the inbounds, so a failure there is reported without an `inbound <id>:` prefix and leaves the client already removed from every inbound.",
+        "parameters": [
+          {
+            "name": "email",
+            "in": "query",
             "required": true,
             "description": "Client email (unique identifier).",
             "schema": {
@@ -9742,7 +10219,7 @@
         "tags": [
           "Clients"
         ],
-        "summary": "Zero up/down counters for many clients in one call. Loops the single-reset path so each client is re-enabled across its attached inbounds and pushed to Xray/remote nodes. Returns the count of successfully reset clients.",
+        "summary": "Zero up/down counters for many clients in one call. Loops the single-reset path so each client its quota had disabled is re-enabled across its attached inbounds and pushed to Xray/remote nodes; a client disabled by hand stays disabled. Returns the count of successfully reset clients.",
         "operationId": "post_panel_api_clients_bulkResetTraffic",
         "requestBody": {
           "required": true,
@@ -10083,7 +10560,7 @@
         "tags": [
           "Clients"
         ],
-        "summary": "Zero out a single client’s up/down counters. Re-enables the client across every attached inbound and pushes the change to Xray (or the remote node) so depleted users can connect again immediately.",
+        "summary": "Zero out a single client’s up/down counters. Re-enables a client its quota had disabled across every attached inbound and pushes the change to Xray (or the remote node) so depleted users can connect again immediately; a client disabled by hand stays disabled.",
         "operationId": "post_panel_api_clients_resetTraffic_email",
         "parameters": [
           {
@@ -10879,6 +11356,9 @@
                       "status": "online",
                       "tlsVerifyMode": "verify",
                       "transitive": false,
+                      "unavailableMetrics": [
+                        ""
+                      ],
                       "updatedAt": 1700003600,
                       "uptimeSecs": 86400,
                       "xrayError": "",
@@ -11080,6 +11560,9 @@
                     "status": "online",
                     "tlsVerifyMode": "verify",
                     "transitive": false,
+                    "unavailableMetrics": [
+                      ""
+                    ],
                     "updatedAt": 1700003600,
                     "uptimeSecs": 86400,
                     "xrayError": "",
@@ -11230,6 +11713,9 @@
                     "status": "online",
                     "tlsVerifyMode": "verify",
                     "transitive": false,
+                    "unavailableMetrics": [
+                      ""
+                    ],
                     "updatedAt": 1700003600,
                     "uptimeSecs": 86400,
                     "xrayError": "",
@@ -11453,6 +11939,9 @@
                     "memPct": 45.2,
                     "panelVersion": "v3.x.x",
                     "status": "online",
+                    "unavailableMetrics": [
+                      ""
+                    ],
                     "uptimeSecs": 86400,
                     "xrayError": "",
                     "xrayState": "",
@@ -11805,11 +12294,16 @@
                         ""
                       ],
                       "port": 0,
+                      "randomCount": 1,
                       "remark": "",
                       "security": "same",
                       "serverDescription": "",
                       "shuffleHost": false,
                       "sni": "",
+                      "sniSharedRandom": false,
+                      "snis": [
+                        ""
+                      ],
                       "sockoptParams": "",
                       "sortOrder": 0,
                       "tags": [
@@ -11817,6 +12311,98 @@
                       ],
                       "verifyPeerCertByName": "",
                       "vlessRoute": ""
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/panel/api/hosts/raw": {
+      "get": {
+        "tags": [
+          "Hosts"
+        ],
+        "summary": "List every host row with its numeric id, for id-based pickers such as the per-client host rule override.",
+        "operationId": "get_panel_api_hosts_raw",
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "msg": {
+                      "type": "string"
+                    },
+                    "obj": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Host"
+                      }
+                    }
+                  }
+                },
+                "example": {
+                  "success": true,
+                  "obj": [
+                    {
+                      "address": "cdn.example.com",
+                      "allowInsecure": false,
+                      "alpn": [
+                        ""
+                      ],
+                      "cipherSuites": "",
+                      "createdAt": 0,
+                      "echConfigList": "",
+                      "excludeFromSubTypes": [
+                        ""
+                      ],
+                      "finalMask": "",
+                      "fingerprint": "",
+                      "groupId": "",
+                      "hostHeader": "",
+                      "id": 1,
+                      "inboundId": 1,
+                      "isDisabled": false,
+                      "isHidden": false,
+                      "keepSniBlank": false,
+                      "mihomoIpVersion": "dual",
+                      "mihomoX25519": false,
+                      "muxParams": null,
+                      "nodeGuids": [
+                        ""
+                      ],
+                      "overrideSniFromAddress": false,
+                      "path": "",
+                      "pinnedPeerCertSha256": [
+                        ""
+                      ],
+                      "port": 8443,
+                      "randomCount": 1,
+                      "remark": "cdn-front",
+                      "security": "same",
+                      "serverDescription": "",
+                      "shuffleHost": false,
+                      "sni": "",
+                      "sniSharedRandom": false,
+                      "snis": [
+                        ""
+                      ],
+                      "sockoptParams": null,
+                      "sortOrder": 0,
+                      "tags": [
+                        ""
+                      ],
+                      "updatedAt": 0,
+                      "verifyPeerCertByName": "",
+                      "vlessRoute": "443"
                     }
                   ]
                 }
@@ -11900,11 +12486,16 @@
                       ""
                     ],
                     "port": 0,
+                    "randomCount": 1,
                     "remark": "",
                     "security": "same",
                     "serverDescription": "",
                     "shuffleHost": false,
                     "sni": "",
+                    "sniSharedRandom": false,
+                    "snis": [
+                      ""
+                    ],
                     "sockoptParams": "",
                     "sortOrder": 0,
                     "tags": [
@@ -11998,11 +12589,16 @@
                         ""
                       ],
                       "port": 0,
+                      "randomCount": 1,
                       "remark": "",
                       "security": "same",
                       "serverDescription": "",
                       "shuffleHost": false,
                       "sni": "",
+                      "sniSharedRandom": false,
+                      "snis": [
+                        ""
+                      ],
                       "sockoptParams": "",
                       "sortOrder": 0,
                       "tags": [
@@ -12146,11 +12742,16 @@
                         ""
                       ],
                       "port": 8443,
+                      "randomCount": 1,
                       "remark": "cdn-front",
                       "security": "same",
                       "serverDescription": "",
                       "shuffleHost": false,
                       "sni": "",
+                      "sniSharedRandom": false,
+                      "snis": [
+                        ""
+                      ],
                       "sockoptParams": null,
                       "sortOrder": 0,
                       "tags": [
@@ -12268,11 +12869,16 @@
                         ""
                       ],
                       "port": 8443,
+                      "randomCount": 1,
                       "remark": "cdn-front",
                       "security": "same",
                       "serverDescription": "",
                       "shuffleHost": false,
                       "sni": "",
+                      "sniSharedRandom": false,
+                      "snis": [
+                        ""
+                      ],
                       "sockoptParams": null,
                       "sortOrder": 0,
                       "tags": [
@@ -12390,7 +12996,7 @@
         "tags": [
           "Hosts"
         ],
-        "summary": "Set host group sort order by the position of each groupId in the array.",
+        "summary": "Set host group sort order by the position of each groupId in the array. IDs must be unique and refer to existing groups; omitted groups follow in their previous order.",
         "operationId": "post_panel_api_hosts_reorder",
         "requestBody": {
           "required": true,
@@ -12520,11 +13126,16 @@
                         ""
                       ],
                       "port": 8443,
+                      "randomCount": 1,
                       "remark": "cdn-front",
                       "security": "same",
                       "serverDescription": "",
                       "shuffleHost": false,
                       "sni": "",
+                      "sniSharedRandom": false,
+                      "snis": [
+                        ""
+                      ],
                       "sockoptParams": null,
                       "sortOrder": 0,
                       "tags": [
@@ -13011,6 +13622,47 @@
         }
       }
     },
+    "/panel/api/setting/tgBotCapabilities": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Report what the configured bot can do. Inline mode is a BotFather switch, so the panel warns when it is off.",
+        "operationId": "post_panel_api_setting_tgBotCapabilities",
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "msg": {
+                      "type": "string"
+                    },
+                    "obj": {
+                      "$ref": "#/components/schemas/TgBotCapabilities"
+                    }
+                  }
+                },
+                "example": {
+                  "success": true,
+                  "obj": {
+                    "groupPrivacy": false,
+                    "inlineEnabled": true,
+                    "running": true,
+                    "username": "xui_bot"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/panel/api/setting/testDiscord": {
       "post": {
         "tags": [
@@ -13104,9 +13756,11 @@
                   "obj": [
                     {
                       "id": 1,
-                      "name": "default",
+                      "name": "central-panel-a",
                       "enabled": true,
-                      "createdAt": 1736000000
+                      "createdAt": 1736000000,
+                      "scope": "node-admin",
+                      "expiresAt": 0
                     }
                   ]
                 }
@@ -13136,7 +13790,13 @@
                   },
                   "scope": {
                     "type": "string",
-                    "description": "admin (default), monitor, or node-sync."
+                    "enum": [
+                      "admin",
+                      "monitor",
+                      "node-sync",
+                      "node-admin"
+                    ],
+                    "description": "admin (default), monitor, node-sync, or node-admin. node-admin inherits node-sync and may also start a panel update."
                   },
                   "expiresAt": {
                     "type": "integer",
@@ -13149,7 +13809,7 @@
               },
               "example": {
                 "name": "central-panel-a",
-                "scope": "node-sync",
+                "scope": "node-admin",
                 "expiresAt": 1798761600000
               }
             }
@@ -16284,6 +16944,9 @@
                   "status": "online",
                   "tlsVerifyMode": "verify",
                   "transitive": false,
+                  "unavailableMetrics": [
+                    ""
+                  ],
                   "updatedAt": 1700003600,
                   "uptimeSecs": 86400,
                   "xrayError": "",

@@ -1,9 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { NativeSelect } from '@/components/form/NativeSelect';
+import { useEffect, useRef, useState, useId } from 'react';
+import type { KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
-import { QuestionCircleOutlined } from '@ant-design/icons';
+
 import dayjs from 'dayjs';
 import {
   Alert,
+  ConfigProvider,
   Form,
   Input,
   InputNumber,
@@ -12,7 +15,6 @@ import {
   Select,
   Switch,
   Tabs,
-  Tooltip,
   message,
 } from 'antd';
 import { Controller, FormProvider, useForm, useWatch } from 'react-hook-form';
@@ -99,20 +101,32 @@ import SniffingTab from './SniffingTab';
 import type { DBInbound } from '@/models/dbinbound';
 import type { NodeRecord } from '@/api/queries/useNodesQuery';
 
-/* Render a field label with a hover tooltip icon instead of an `extra` help line below. */
-const labelWithHint = (label: string, hint: string) => (
-  <span>
-    {label}
-    <Tooltip title={hint}>
-      <QuestionCircleOutlined style={{ marginInlineStart: 4, color: 'rgba(128,128,128,0.65)' }} />
-    </Tooltip>
-  </span>
-);
-
 const PROTOCOL_OPTIONS = Object.values(Protocols).map((p) => ({ value: p, label: p }));
 const SHARE_ADDR_STRATEGIES = ['node', 'listen', 'custom'] as const;
 const SHARE_ADDR_HOSTNAME_RE =
   /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
+
+function inboundPopupContainer(trigger?: HTMLElement): HTMLElement {
+  return (
+    trigger?.closest<HTMLElement>('.ant-modal-body') ?? trigger?.parentElement ?? document.body
+  );
+}
+
+function loopInboundFocus(event: KeyboardEvent<HTMLDivElement>) {
+  if (event.key !== 'Tab') return;
+  const first = event.currentTarget.querySelector<HTMLButtonElement>(
+    '.ant-modal-close:not(:disabled)',
+  );
+  const last = Array.from(
+    event.currentTarget.querySelectorAll<HTMLButtonElement>(
+      '.ant-modal-footer button:not(:disabled)',
+    ),
+  ).at(-1);
+  if (first && last && event.target === (event.shiftKey ? first : last)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  }
+}
 
 function isValidShareAddrInput(value: string): boolean {
   const v = value.trim();
@@ -240,6 +254,7 @@ export default function InboundFormModal({
   availableNodesFetched = true,
 }: InboundFormModalProps) {
   const { t } = useTranslation();
+  const uid = useId();
   const [messageApi, messageContextHolder] = message.useMessage();
   const [modal, modalContextHolder] = Modal.useModal();
   const methods = useForm<InboundFormValues>({ defaultValues: buildAddModeValues() });
@@ -247,11 +262,14 @@ export default function InboundFormModal({
   const getV = methods.getValues as unknown as (name?: string) => unknown;
   const control = methods.control;
   const [saving, setSaving] = useState(false);
+  const savedInboundId = useRef<number | null>(null);
   const [scanning, setScanning] = useState(false);
   const [scanResult, setScanResult] = useState<RealityScanResult | null>(null);
   const [activeTab, setActiveTab] = useState('basic');
   const {
     fallbacks,
+    hasStoredFallbacks,
+    fallbacksLoaded,
     fallbackChildOptions,
     loadFallbacks,
     saveFallbacks,
@@ -271,6 +289,7 @@ export default function InboundFormModal({
    * always empty. Offer it only then; `listen`/`custom` work for local inbounds.
    */
   const nodeShareOptionAvailable = selectableNodes.length > 0 && isNodeEligible;
+  const vlessDecryption = useWatch({ control, name: 'settings.decryption' }) ?? '';
   const vlessEncryption = useWatch({ control, name: 'settings.encryption' }) ?? '';
   const ssMethod = useWatch({ control, name: 'settings.method' });
   const isSSWith2022 = isSS2022({
@@ -316,7 +335,10 @@ export default function InboundFormModal({
     streamSettings: { network },
     settings: { network: wSsNetwork, allowedNetwork: wTunnelNetwork, udp: mixedUdpOn },
   });
+  const hasVlessDecryption =
+    protocol === Protocols.VLESS && vlessDecryption !== '' && vlessDecryption !== 'none';
   const isFallbackHost =
+    !hasVlessDecryption &&
     (protocol === Protocols.VLESS || protocol === Protocols.TROJAN) &&
     network === 'tcp' &&
     (security === 'tls' || security === 'reality');
@@ -458,6 +480,7 @@ export default function InboundFormModal({
         ? withoutClients(rawInboundToFormValues(dbInbound))
         : buildAddModeValues();
     methods.reset(initial);
+    savedInboundId.current = null;
     setScanResult(null);
     setActiveTab('basic');
     const initialTag = (initial.tag ?? '') as string;
@@ -594,19 +617,46 @@ export default function InboundFormModal({
       );
       return;
     }
+    if (saving) return;
+    if (!fallbacksLoaded) {
+      messageApi.error(t('pages.inbounds.fallbacks.saveFailed'));
+      return;
+    }
+    if (!isFallbackHost && fallbacks.length > 0) {
+      setActiveTab('protocol');
+      messageApi.error(
+        t(
+          hasVlessDecryption
+            ? 'pages.inbounds.fallbacks.decryptionConflict'
+            : 'pages.inbounds.fallbacks.needsTls',
+        ),
+      );
+      return;
+    }
     setSaving(true);
     try {
-      const payload = formValuesToWirePayload(parsed.data, { omitClients: mode === 'edit' });
-      const url =
-        mode === 'edit' && dbInbound
-          ? `/panel/api/inbounds/update/${dbInbound.id}`
-          : '/panel/api/inbounds/add';
+      // Persist an explicit removal before the backend checks the new decryption setting.
+      if (!isFallbackHost && hasStoredFallbacks && dbInbound) {
+        if (!(await saveFallbacks(dbInbound.id))) {
+          messageApi.error(t('pages.inbounds.fallbacks.saveFailed'));
+          return;
+        }
+      }
+      const existingId = mode === 'edit' ? dbInbound?.id : savedInboundId.current;
+      const payload = formValuesToWirePayload(parsed.data, { omitClients: !!existingId });
+      const url = existingId
+        ? `/panel/api/inbounds/update/${existingId}`
+        : '/panel/api/inbounds/add';
       const msg = await HttpUtil.post(url, payload);
       if (msg?.success) {
         if (isFallbackHost) {
           const obj = msg.obj as { id?: number; Id?: number } | null;
-          const masterId = mode === 'edit' ? dbInbound!.id : (obj?.id ?? obj?.Id ?? 0);
-          if (masterId) await saveFallbacks(masterId);
+          const masterId = existingId ?? obj?.id ?? obj?.Id ?? 0;
+          if (masterId) savedInboundId.current = masterId;
+          if (masterId && !(await saveFallbacks(masterId))) {
+            messageApi.error(t('pages.inbounds.fallbacks.saveFailed'));
+            return;
+          }
         }
         onSaved();
         onClose();
@@ -663,12 +713,13 @@ export default function InboundFormModal({
       )}
 
       <FormField name="protocol" label={t('pages.inbounds.protocol')}>
-        <Select id="protocol" disabled={mode === 'edit'} options={PROTOCOL_OPTIONS} />
+        <NativeSelect id="protocol" disabled={mode === 'edit'} options={PROTOCOL_OPTIONS} />
       </FormField>
 
       <FormField
         name="listen"
-        label={labelWithHint(t('pages.inbounds.address'), t('pages.inbounds.form.listenHelp'))}
+        label={t('pages.inbounds.address')}
+        tooltip={t('pages.inbounds.form.listenHelp')}
       >
         <Input placeholder={t('pages.inbounds.monitorDesc')} />
       </FormField>
@@ -677,12 +728,10 @@ export default function InboundFormModal({
         <>
           <FormField
             name="shareAddrStrategy"
-            label={labelWithHint(
-              t('pages.inbounds.form.shareAddrStrategy'),
-              t('pages.inbounds.form.shareAddrStrategyHelp'),
-            )}
+            label={t('pages.inbounds.form.shareAddrStrategy')}
+            tooltip={t('pages.inbounds.form.shareAddrStrategyHelp')}
           >
-            <Select
+            <NativeSelect
               options={SHARE_ADDR_STRATEGIES.filter(
                 (strategy) => strategy !== 'node' || nodeShareOptionAvailable,
               ).map((strategy) => ({
@@ -695,10 +744,8 @@ export default function InboundFormModal({
           {shareAddrStrategy === 'custom' && (
             <FormField
               name="shareAddr"
-              label={labelWithHint(
-                t('pages.inbounds.form.shareAddr'),
-                t('pages.inbounds.form.shareAddrHelp'),
-              )}
+              label={t('pages.inbounds.form.shareAddr')}
+              tooltip={t('pages.inbounds.form.shareAddrHelp')}
               rules={{
                 validate: (value) =>
                   isValidShareAddrInput(String(value ?? '')) ||
@@ -713,10 +760,8 @@ export default function InboundFormModal({
 
       <FormField
         name="subSortIndex"
-        label={labelWithHint(
-          t('pages.inbounds.form.subSortIndex'),
-          t('pages.inbounds.form.subSortIndexHelp'),
-        )}
+        label={t('pages.inbounds.form.subSortIndex')}
+        tooltip={t('pages.inbounds.form.subSortIndexHelp')}
       >
         <InputNumber />
       </FormField>
@@ -724,10 +769,8 @@ export default function InboundFormModal({
       <FormField
         name="excludeFromSub"
         valueProp="checked"
-        label={labelWithHint(
-          t('pages.inbounds.form.excludeFromSub'),
-          t('pages.inbounds.form.excludeFromSubHelp'),
-        )}
+        label={t('pages.inbounds.form.excludeFromSub')}
+        tooltip={t('pages.inbounds.form.excludeFromSubHelp')}
       >
         <Switch />
       </FormField>
@@ -736,10 +779,8 @@ export default function InboundFormModal({
         <FormField
           name="disableFlow"
           valueProp="checked"
-          label={labelWithHint(
-            t('pages.inbounds.form.disableFlow'),
-            t('pages.inbounds.form.disableFlowHelp'),
-          )}
+          label={t('pages.inbounds.form.disableFlow')}
+          tooltip={t('pages.inbounds.form.disableFlowHelp')}
         >
           <Switch />
         </FormField>
@@ -754,13 +795,13 @@ export default function InboundFormModal({
       </FormField>
 
       <Form.Item
-        label={
-          <Tooltip title={t('pages.inbounds.meansNoLimit')}>
-            {t('pages.inbounds.totalFlow')}
-          </Tooltip>
-        }
+        htmlFor={`${uid}-totalFlow`}
+        label={t('pages.inbounds.totalFlow')}
+        tooltip={t('pages.inbounds.meansNoLimit')}
       >
         <InputNumber
+          id={`${uid}-totalFlow`}
+          aria-describedby={`${uid}-totalFlow-hint`}
           value={wTotal ? Math.round((wTotal / SizeFormatter.ONE_GB) * 100) / 100 : 0}
           min={0}
           step={1}
@@ -769,10 +810,13 @@ export default function InboundFormModal({
             setV('total', bytes);
           }}
         />
+        <span id={`${uid}-totalFlow-hint`} hidden>
+          {t('pages.inbounds.meansNoLimit')}
+        </span>
       </Form.Item>
 
       <FormField name="trafficReset" label={t('pages.inbounds.periodicTrafficResetTitle')}>
-        <Select
+        <NativeSelect
           options={TRAFFIC_RESETS.map((r) => ({
             value: r,
             label: t(`pages.inbounds.periodicTrafficReset.${r}`),
@@ -791,22 +835,26 @@ export default function InboundFormModal({
       )}
 
       <Form.Item
-        label={
-          <Tooltip title={t('pages.inbounds.leaveBlankToNeverExpire')}>
-            {t('pages.inbounds.expireDate')}
-          </Tooltip>
-        }
+        htmlFor={`${uid}-expiryTime`}
+        label={t('pages.inbounds.expireDate')}
+        tooltip={t('pages.inbounds.leaveBlankToNeverExpire')}
       >
         <DateTimePicker
+          id={`${uid}-expiryTime`}
+          aria-describedby={`${uid}-expiryTime-hint`}
           value={wExpiry > 0 ? dayjs(wExpiry) : null}
           onChange={(d) => setV('expiryTime', d ? d.valueOf() : 0)}
         />
+        <span id={`${uid}-expiryTime-hint`} hidden>
+          {t('pages.inbounds.leaveBlankToNeverExpire')}
+        </span>
       </Form.Item>
     </>
   );
 
   const fallbacksCard = (
     <FallbacksCard
+      canAdd={isFallbackHost && fallbacksLoaded}
       fallbacks={fallbacks}
       fallbackChildOptions={fallbackChildOptions}
       addFallback={addFallback}
@@ -858,9 +906,18 @@ export default function InboundFormModal({
         />
       )}
 
-      {isFallbackHost && fallbacksCard}
+      {(isFallbackHost || fallbacks.length > 0) && fallbacksCard}
+      {hasVlessDecryption && (
+        <Alert
+          className="mt-12"
+          type="warning"
+          showIcon
+          title={t('pages.inbounds.fallbacks.decryptionConflict')}
+        />
+      )}
       {(protocol === Protocols.VLESS || protocol === Protocols.TROJAN) &&
         network === 'tcp' &&
+        !hasVlessDecryption &&
         !isFallbackHost && (
           <Alert
             className="mt-12"
@@ -936,8 +993,9 @@ export default function InboundFormModal({
   const streamTab = (
     <>
       {hasSelectableTransport && (
-        <Form.Item label={t('transmission')}>
-          <Select
+        <Form.Item htmlFor={`${uid}-network`} label={t('transmission')}>
+          <NativeSelect
+            id={`${uid}-network`}
             style={{ width: '75%' }}
             value={network}
             onChange={onNetworkChange}
@@ -948,7 +1006,7 @@ export default function InboundFormModal({
               { value: 'grpc', label: 'gRPC' },
               { value: 'httpupgrade', label: 'HTTPUpgrade' },
               { value: 'xhttp', label: 'XHTTP' },
-              { value: 'xdrive', label: 'XDRIVE' },
+              ...(protocol === Protocols.VLESS ? [{ value: 'xdrive', label: 'XDRIVE' }] : []),
             ]}
           />
         </Form.Item>
@@ -1012,8 +1070,11 @@ export default function InboundFormModal({
 
   const securityTab = (
     <>
-      <Form.Item label={t('pages.inbounds.securityTab')}>
+      <Form.Item
+        label={<span id={`${uid}-security-label`}>{t('pages.inbounds.securityTab')}</span>}
+      >
         <Radio.Group
+          aria-labelledby={`${uid}-security-label`}
           value={security}
           buttonStyle="solid"
           disabled={!tlsOk}
@@ -1152,7 +1213,7 @@ export default function InboundFormModal({
   const sniffingTab = <SniffingTab />;
 
   return (
-    <>
+    <ConfigProvider virtual={false} getPopupContainer={inboundPopupContainer}>
       {messageContextHolder}
       {modalContextHolder}
       <Modal
@@ -1166,6 +1227,11 @@ export default function InboundFormModal({
         onOk={submit}
         onCancel={onClose}
         destroyOnHidden
+        modalRender={(content) => (
+          <div role="presentation" onKeyDown={loopInboundFocus}>
+            {content}
+          </div>
+        )}
       >
         <FormProvider {...methods}>
           <Form
@@ -1198,7 +1264,9 @@ export default function InboundFormModal({
                     Protocols.TUIC,
                     Protocols.MASQUE,
                   ] as string[]
-                ).includes(protocol) || isFallbackHost
+                ).includes(protocol) ||
+                isFallbackHost ||
+                fallbacks.length > 0
                   ? [
                       {
                         key: 'protocol',
@@ -1249,6 +1317,6 @@ export default function InboundFormModal({
           </Form>
         </FormProvider>
       </Modal>
-    </>
+    </ConfigProvider>
   );
 }

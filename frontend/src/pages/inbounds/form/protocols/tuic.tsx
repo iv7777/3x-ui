@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { NativeSelect } from '@/components/form/NativeSelect';
+import { useState, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AutoComplete,
@@ -16,11 +17,13 @@ import {
 import { CloudDownloadOutlined, SyncOutlined } from '@ant-design/icons';
 import { useFormContext, useWatch } from 'react-hook-form';
 
+import { selectTagRender } from '@/components/form';
 import { FormField } from '@/components/form/rhf';
 import { HttpUtil } from '@/utils';
 
 export default function TuicFields() {
   const { t } = useTranslation();
+  const uid = useId();
   const [messageApi, messageContextHolder] = message.useMessage();
   const { control, setValue } = useFormContext();
   const [loadingPanelCert, setLoadingPanelCert] = useState(false);
@@ -66,7 +69,7 @@ export default function TuicFields() {
       if (obj.webKeyFile) {
         setValue('settings.server.private_key', obj.webKeyFile);
       }
-      messageApi.success(t('pages.inbounds.setSuccess'));
+      messageApi.success(t('success'));
     } catch {
       messageApi.error(t('somethingWentWrong'));
     } finally {
@@ -109,7 +112,7 @@ export default function TuicFields() {
             label={t('pages.xray.tuic.logLevel')}
             tooltip={t('pages.xray.tuic.logLevelHint')}
           >
-            <Select
+            <NativeSelect
               options={[
                 { label: 'Info', value: 'info' },
                 { label: 'Warn', value: 'warn' },
@@ -147,8 +150,9 @@ export default function TuicFields() {
   return (
     <>
       {messageContextHolder}
-      <Form.Item label={t('pages.inbounds.publicKey')}>
+      <Form.Item htmlFor={`${uid}-certificate`} label={t('pages.inbounds.publicKey')}>
         <AutoComplete
+          id={`${uid}-certificate`}
           value={certificate}
           options={certOptions}
           onChange={(v) => setValue('settings.server.certificate', v)}
@@ -156,8 +160,9 @@ export default function TuicFields() {
         />
       </Form.Item>
 
-      <Form.Item label={t('pages.inbounds.privatekey')}>
+      <Form.Item htmlFor={`${uid}-privateKey`} label={t('pages.inbounds.privatekey')}>
         <AutoComplete
+          id={`${uid}-privateKey`}
           value={privateKey}
           options={keyOptions}
           onChange={(v) => setValue('settings.server.private_key', v)}
@@ -169,13 +174,13 @@ export default function TuicFields() {
         <Space wrap style={{ display: 'flex', flexWrap: 'wrap', width: '100%' }}>
           <Button
             type="primary"
-            icon={<CloudDownloadOutlined />}
+            icon={<CloudDownloadOutlined aria-hidden />}
             loading={loadingPanelCert}
             onClick={setCertFromPanel}
           >
             {t('pages.inbounds.setDefaultCert')}
           </Button>
-          <Button icon={<SyncOutlined />} onClick={autofillFromSni}>
+          <Button icon={<SyncOutlined aria-hidden />} onClick={autofillFromSni}>
             {t('pages.inbounds.form.autoFill')}
           </Button>
           <Button
@@ -195,7 +200,7 @@ export default function TuicFields() {
         label={t('pages.xray.tuic.congestionControl')}
         tooltip={t('pages.xray.tuic.congestionControlHint')}
       >
-        <Select
+        <NativeSelect
           options={[
             { label: 'BBR', value: 'bbr' },
             { label: 'CUBIC', value: 'cubic' },
@@ -207,6 +212,7 @@ export default function TuicFields() {
       <FormField name={['settings', 'server', 'alpn']} label={t('pages.xray.tuic.alpn')}>
         <Select
           mode="tags"
+          tagRender={selectTagRender}
           tokenSeparators={[',']}
           options={[
             { label: 'h3', value: 'h3' },
@@ -217,12 +223,21 @@ export default function TuicFields() {
 
       <Divider titlePlacement="start">{t('pages.xray.tuic.profileOptions')}</Divider>
 
-      <Form.Item label={t('pages.xray.tuic.sni')} tooltip={t('pages.xray.tuic.sniHint')}>
+      <Form.Item
+        htmlFor={`${uid}-sni`}
+        label={t('pages.xray.tuic.sni')}
+        tooltip={t('pages.xray.tuic.sniHint')}
+      >
         <Input
+          id={`${uid}-sni`}
+          aria-describedby={`${uid}-sni-hint`}
           value={sni}
           placeholder="example.com"
           onChange={(e) => handleSniChange(e.target.value)}
         />
+        <span id={`${uid}-sni-hint`} hidden>
+          {t('pages.xray.tuic.sniHint')}
+        </span>
       </Form.Item>
 
       <FormField
@@ -230,7 +245,7 @@ export default function TuicFields() {
         label={t('pages.xray.tuic.udpRelayMode')}
         tooltip={t('pages.xray.tuic.udpRelayModeHint')}
       >
-        <Select
+        <NativeSelect
           options={[
             { label: 'Native (Recommended)', value: 'native' },
             { label: 'QUIC', value: 'quic' },

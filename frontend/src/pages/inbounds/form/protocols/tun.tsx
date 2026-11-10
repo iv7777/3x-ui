@@ -1,43 +1,56 @@
-import type { ReactNode } from 'react';
+import { useId, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Form, Input, InputNumber, Select, Space, Switch, Tooltip } from 'antd';
+import { Button, Form, Input, InputNumber, Select, Space, Switch } from 'antd';
 import { MinusOutlined, PlusOutlined } from '@ant-design/icons';
 import { useFieldArray, useFormContext } from 'react-hook-form';
 
+import { selectTagRender } from '@/components/form';
 import { FormField } from '@/components/form/rhf';
 
 interface StringListProps {
   name: string[];
   label: ReactNode;
+  tooltip?: string;
   placeholder: (index: number) => string;
 }
 
-function StringList({ name, label, placeholder }: StringListProps) {
+function StringList({ name, label, tooltip, placeholder }: StringListProps) {
   const { t } = useTranslation();
+  const labelId = useId();
   const { control } = useFormContext();
   const { fields, append, remove } = useFieldArray({ control, name: name.join('.') });
   return (
-    <Form.Item label={label}>
+    <Form.Item label={<span id={labelId}>{label}</span>} tooltip={tooltip}>
       <Button aria-label={t('add')} size="small" onClick={() => append('')}>
-        <PlusOutlined />
+        <PlusOutlined aria-hidden />
       </Button>
       {fields.map((field, j) => (
         <Space.Compact key={field.id} block className="mt-4">
           <FormField name={[...name, j]} noStyle>
-            <Input placeholder={placeholder(j)} />
+            <Input
+              aria-labelledby={labelId}
+              aria-describedby={tooltip ? `${labelId}-hint` : undefined}
+              placeholder={placeholder(j)}
+            />
           </FormField>
           <Button aria-label={t('remove')} size="small" onClick={() => remove(j)}>
-            <MinusOutlined />
+            <MinusOutlined aria-hidden />
           </Button>
         </Space.Compact>
       ))}
+      {tooltip && (
+        <span id={`${labelId}-hint`} hidden>
+          {tooltip}
+        </span>
+      )}
     </Form.Item>
   );
 }
 
-// xray-core 26.9.30 accepts exactly these autoSystemWfpBlockLeak values.
+// Named autoSystemWfpBlockLeak values; xray-core 26.10.31 also takes typed "tcp/<port>" or "udp/<port>".
 const WFP_BLOCK_LEAK_OPTIONS = [
   { value: 'dns', label: 'dns' },
+  { value: 'windnsclient', label: 'windnsclient' },
   { value: 'misconfigtun', label: 'misconfigtun' },
 ];
 
@@ -73,20 +86,14 @@ export default function TunFields() {
       </FormField>
       <StringList
         name={['settings', 'autoSystemRoutingTable']}
-        label={
-          <Tooltip title={t('pages.inbounds.form.autoSystemRoutesTooltip')}>
-            {t('pages.inbounds.info.autoSystemRoutes')}
-          </Tooltip>
-        }
+        label={t('pages.inbounds.info.autoSystemRoutes')}
+        tooltip={t('pages.inbounds.form.autoSystemRoutesTooltip')}
         placeholder={(j) => (j === 0 ? '0.0.0.0/0' : '::/0')}
       />
       <FormField
         name={['settings', 'autoOutboundsInterface']}
-        label={
-          <Tooltip title={t('pages.inbounds.form.autoOutboundsInterfaceTooltip')}>
-            {t('pages.inbounds.form.autoOutboundsInterface')}
-          </Tooltip>
-        }
+        label={t('pages.inbounds.form.autoOutboundsInterface')}
+        tooltip={t('pages.inbounds.form.autoOutboundsInterfaceTooltip')}
       >
         <Input placeholder="auto" />
       </FormField>
@@ -105,7 +112,9 @@ export default function TunFields() {
       >
         <Select
           id="tun-wfp-block-leak"
-          mode="multiple"
+          mode="tags"
+          tagRender={selectTagRender}
+          tokenSeparators={[',', ' ']}
           allowClear
           options={WFP_BLOCK_LEAK_OPTIONS}
         />

@@ -10,6 +10,7 @@ import (
 	"github.com/op/go-logging"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/amneziawg"
+	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgkern"
 	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgnet"
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
@@ -25,6 +26,46 @@ var awgTestPrivateKey, awgTestPublicKey = func() (string, string) {
 	}
 	return priv, pub
 }()
+
+func TestNormalizeAmneziaWGSettingsRejectsKernelSubnetMismatch(t *testing.T) {
+	setupConflictDB(t)
+	for _, remote := range []bool{false, true} {
+		t.Run(fmt.Sprintf("remote=%t", remote), func(t *testing.T) {
+			server, err := defaultAmneziaWGServer()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server.SubnetIP = "10.9.1.0"
+			client := model.Client{Email: "restored@awg", Enable: true, PublicKey: awgTestPublicKey, AllowedIPs: []string{"10.8.1.2/32"}}
+			settings := amneziawg.InboundSettings{Server: server, Clients: []model.Client{client}}
+			marshal := func() string {
+				b, err := json.Marshal(settings)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return string(b)
+			}
+			old := &model.Inbound{Protocol: model.AmneziaWG, Enable: true, Settings: marshal()}
+			if remote {
+				old.NodeID = new(7)
+			}
+			if err := (&InboundService{}).normalizeAmneziaWGSettings(old, nil); err != nil {
+				t.Fatalf("embedded mode must remain editable: %v", err)
+			}
+			server.KernelMode = true
+			inbound := *old
+			inbound.Settings = marshal()
+			err = (&InboundService{}).normalizeAmneziaWGSettings(&inbound, old)
+			if err == nil || !strings.Contains(err.Error(), `peer "restored@awg" allowedIPs "10.8.1.2/32" is outside kernel interface subnets [10.9.1.0/24]`) {
+				t.Fatalf("kernel-mode save error = %v, want the mismatched peer and server subnet", err)
+			}
+			inbound.Enable = false
+			if err := (&InboundService{}).normalizeAmneziaWGSettings(&inbound, old); err != nil {
+				t.Fatalf("disabling a broken inbound must remain possible: %v", err)
+			}
+		})
+	}
+}
 
 func TestCheckForwardedPortsConflict_EmptySpecNoConflict(t *testing.T) {
 	setupConflictDB(t)
@@ -144,7 +185,7 @@ func TestNormalizeAmneziaWGSettings_GeneratesFull31Set(t *testing.T) {
 	setupConflictDB(t)
 	svc := &InboundService{}
 	inbound := &model.Inbound{Protocol: model.AmneziaWG, Port: 51820, Settings: ""}
-	if err := svc.normalizeAmneziaWGSettings(inbound, ""); err != nil {
+	if err := svc.normalizeAmneziaWGSettings(inbound, nil); err != nil {
 		t.Fatalf("normalize empty settings: %v", err)
 	}
 
@@ -199,7 +240,7 @@ func TestNormalizeAmneziaWGSettings_RejectsBad31Values(t *testing.T) {
 			Port:     51820,
 			Settings: `{"server":{"privateKey":"x","publicKey":"y","subnetIp":"10.8.1.0","subnetCidr":24,` + c.snippet + `},"clients":[]}`,
 		}
-		if err := svc.normalizeAmneziaWGSettings(inbound, ""); err == nil {
+		if err := svc.normalizeAmneziaWGSettings(inbound, nil); err == nil {
 			t.Errorf("%s must be rejected", c.name)
 		}
 	}
@@ -214,7 +255,7 @@ func TestNormalizeAmneziaWGSettings_CanonicalizesRangeValues(t *testing.T) {
 		Settings: `{"server":{"privateKey":"x","publicKey":"y","subnetIp":"10.8.1.0","subnetCidr":24,` +
 			`"rekeyAfterTime":"110 - 140","rejectAfterTime":"190-250","keepaliveTimeout":"   "},"clients":[]}`,
 	}
-	if err := svc.normalizeAmneziaWGSettings(inbound, ""); err != nil {
+	if err := svc.normalizeAmneziaWGSettings(inbound, nil); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
 	var parsed amneziawg.InboundSettings
@@ -256,12 +297,36 @@ func TestNormalizeAmneziaWGSettings_RejectsInjectedClientAllowedIPs(t *testing.T
 			`"clients":[{"email":"a@x","enable":true,"publicKey":"pk",` +
 			`"allowedIPs":["10.8.1.2/32\n[Interface]\nPostUp = touch /tmp/pwned"]}]}`,
 	}
-	err := svc.normalizeAmneziaWGSettings(inbound, "")
+	err := svc.normalizeAmneziaWGSettings(inbound, nil)
 	if err == nil {
 		t.Fatalf("an allowedIPs entry carrying a config-injection payload must be rejected; settings became:\n%s", inbound.Settings)
 	}
 	if !strings.Contains(err.Error(), "allowedIPs") {
 		t.Errorf("error should name the offending field, got %q", err)
+	}
+}
+
+// A protocol switch keeps the stored clients, re-injected after the AmneziaWG
+// normalize ran, so a WireGuard row's bad allowedIPs skipped every check.
+func TestUpdateInbound_ProtocolSwitchRejectsStoredClientAllowedIPs(t *testing.T) {
+	setupConflictDB(t)
+	stored := mkInbound(t, 51830, model.WireGuard, `{"secretKey":"`+awgTestPrivateKey+`","clients":[{"email":"sw@x","enable":true,`+
+		`"privateKey":"`+awgTestPrivateKey+`","publicKey":"`+awgTestPublicKey+`","allowedIPs":["10.8.1.2/32\n[Interface]\nPostUp = touch /tmp/pwned"]}]}`)
+
+	update := *stored
+	update.Protocol = model.AmneziaWG
+	update.Settings = `{"server":{"privateKey":"x","publicKey":"y","subnetIp":"10.8.1.0","subnetCidr":24},"clients":[]}`
+	_, _, err := (&InboundService{}).UpdateInbound(&update)
+	if err == nil || !strings.Contains(err.Error(), "invalid allowedIPs entry") {
+		t.Fatalf("UpdateInbound err = %v, want an invalid allowedIPs entry error", err)
+	}
+
+	var after model.Inbound
+	if err := database.GetDB().First(&after, stored.Id).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if after.Protocol != model.WireGuard {
+		t.Fatalf("rejected switch was persisted: protocol = %q", after.Protocol)
 	}
 }
 
@@ -274,7 +339,7 @@ func TestNormalizeAmneziaWGSettings_CanonicalizesClientAllowedIPs(t *testing.T) 
 		Settings: `{"server":{"privateKey":"x","publicKey":"y","subnetIp":"10.8.1.0","subnetCidr":24},` +
 			`"clients":[{"email":"a@x","enable":true,"publicKey":"pk","allowedIPs":[" 10.8.1.2 "]}]}`,
 	}
-	if err := svc.normalizeAmneziaWGSettings(inbound, ""); err != nil {
+	if err := svc.normalizeAmneziaWGSettings(inbound, nil); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
 	var parsed amneziawg.InboundSettings
@@ -374,6 +439,26 @@ func TestCheckForwardedPortsConflict_CollidesWithAmneziawgnetSocksPort(t *testin
 	}
 }
 
+func TestCheckForwardedPortsConflict_KernelAmneziaWGHasNoEmbeddedRelay(t *testing.T) {
+	setupConflictDB(t)
+	seedInboundConflict(t, "awg-kernel", "0.0.0.0", 51820, model.AmneziaWG, ``,
+		`{"server":{"privateKey":"priv","publicKey":"pub","subnetIp":"10.8.1.0","subnetCidr":24,"kernelMode":true},"clients":[]}`)
+
+	var awgInbound model.Inbound
+	if err := database.GetDB().Where("tag = ?", "awg-kernel").First(&awgInbound).Error; err != nil {
+		t.Fatalf("read seeded row: %v", err)
+	}
+	svc := &InboundService{}
+	ctx, err := svc.loadPortConflictContext(database.GetDB(), nil)
+	if err != nil {
+		t.Fatalf("loadPortConflictContext: %v", err)
+	}
+	relayPort := amneziawgnet.SOCKSPortForInbound(awgInbound.Id)
+	if hit := svc.checkForwardedPortsConflict(ctx, fmt.Sprintf("%d", relayPort)); hit != "" {
+		t.Fatalf("kernel-mode AmneziaWG must not reserve embedded relay port %d, got collision %q", relayPort, hit)
+	}
+}
+
 // A cleared DNS field is meaningful (no DNS line in client configs) and must
 // survive the save round-trip instead of resurrecting the frontend defaults.
 func TestNormalizeAmneziaWGSettingsKeepsClearedDNS(t *testing.T) {
@@ -389,7 +474,7 @@ func TestNormalizeAmneziaWGSettingsKeepsClearedDNS(t *testing.T) {
 		t.Fatalf("marshal settings: %v", err)
 	}
 	inbound := &model.Inbound{Protocol: model.AmneziaWG, Settings: string(bs)}
-	if err := (&InboundService{}).normalizeAmneziaWGSettings(inbound, ""); err != nil {
+	if err := (&InboundService{}).normalizeAmneziaWGSettings(inbound, nil); err != nil {
 		t.Fatalf("normalizeAmneziaWGSettings: %v", err)
 	}
 	for _, key := range []string{`"primaryDns"`, `"secondaryDns"`} {
@@ -408,7 +493,7 @@ func TestNormalizeAmneziaWGSettings_RejectsEmptyClientAllowedIPs(t *testing.T) {
 		"server": {"privateKey":"` + awgTestPrivateKey + `","publicKey":"` + awgTestPublicKey + `","subnetIp":"10.8.1.0","subnetCidr":24},
 		"clients": [{"email":"ghost","enable":true,"publicKey":"` + awgTestPublicKey + `","allowedIPs":[]}]
 	}`}
-	err := svc.normalizeAmneziaWGSettings(inbound, "")
+	err := svc.normalizeAmneziaWGSettings(inbound, nil)
 	if err == nil || !strings.Contains(err.Error(), "allowedIPs is required") {
 		t.Fatalf("err = %v, want an allowedIPs refusal naming the client", err)
 	}
@@ -425,7 +510,7 @@ func TestNormalizeAmneziaWGSettings_KeepsStoredServerKeysWhenOmitted(t *testing.
 	stored := `{"server":{"privateKey":"` + awgTestPrivateKey + `","publicKey":"` + awgTestPublicKey + `","subnetIp":"10.8.1.0","subnetCidr":24}}`
 
 	inbound := &model.Inbound{Protocol: model.AmneziaWG, Port: 51824, Settings: `{"server":{"subnetIp":"10.8.1.0","subnetCidr":24,"randomTrailers":true}}`}
-	if err := svc.normalizeAmneziaWGSettings(inbound, stored); err != nil {
+	if err := svc.normalizeAmneziaWGSettings(inbound, &model.Inbound{Settings: stored}); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
 	var parsed amneziawg.InboundSettings
@@ -443,7 +528,7 @@ func TestNormalizeAmneziaWGSettings_DerivesServerPublicKeyFromPrivate(t *testing
 	setupConflictDB(t)
 	svc := &InboundService{}
 	inbound := &model.Inbound{Protocol: model.AmneziaWG, Port: 51825, Settings: `{"server":{"privateKey":"` + awgTestPrivateKey + `","subnetIp":"10.8.1.0","subnetCidr":24}}`}
-	if err := svc.normalizeAmneziaWGSettings(inbound, ""); err != nil {
+	if err := svc.normalizeAmneziaWGSettings(inbound, nil); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
 	var parsed amneziawg.InboundSettings
@@ -456,5 +541,216 @@ func TestNormalizeAmneziaWGSettings_DerivesServerPublicKeyFromPrivate(t *testing
 	}
 	if parsed.Server.PublicKey != want {
 		t.Fatalf("server publicKey = %q, want %q derived from the supplied private key", parsed.Server.PublicKey, want)
+	}
+}
+
+func TestNormalizeAmneziaWGSettingsDefersNodeKernelPreflightToRemoteHost(t *testing.T) {
+	setupConflictDB(t)
+	server, err := defaultAmneziaWGServer()
+	if err != nil {
+		t.Fatalf("defaultAmneziaWGServer: %v", err)
+	}
+	server.KernelMode = true
+	settings, err := json.Marshal(amneziawg.InboundSettings{Server: server, Clients: []model.Client{}})
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	inbound := &model.Inbound{
+		Protocol: model.AmneziaWG,
+		NodeID:   new(7),
+		Port:     51820,
+		Settings: string(settings),
+	}
+	if err := (&InboundService{}).normalizeAmneziaWGSettings(inbound, nil); err != nil {
+		t.Fatalf("master must defer kernel readiness to the target node: %v", err)
+	}
+	var normalized amneziawg.InboundSettings
+	if err := json.Unmarshal([]byte(inbound.Settings), &normalized); err != nil {
+		t.Fatalf("decode normalized settings: %v", err)
+	}
+	if normalized.Server == nil || !normalized.Server.KernelMode {
+		t.Fatalf("normalized node settings lost kernel mode: %+v", normalized.Server)
+	}
+}
+
+// TestNormalizeAmneziaWGSettingsGatesHostReadinessOnlyWhenEnablingKernelMode:
+// a host that loses its module after enabling must not lock the inbound's edits.
+func TestNormalizeAmneziaWGSettingsGatesHostReadinessOnlyWhenEnablingKernelMode(t *testing.T) {
+	setupConflictDB(t)
+	if amneziawgkern.HostReadiness().Ready {
+		t.Skip("this host can run kernel mode, so host readiness cannot refuse anything here")
+	}
+	server, err := defaultAmneziaWGServer()
+	if err != nil {
+		t.Fatalf("defaultAmneziaWGServer: %v", err)
+	}
+	embeddedServer := *server
+	server.KernelMode = true
+	kernelSettings, err := json.Marshal(amneziawg.InboundSettings{Server: server, Clients: []model.Client{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	embeddedSettings, err := json.Marshal(amneziawg.InboundSettings{Server: &embeddedServer, Clients: []model.Client{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kernelRow := func(enable bool) *model.Inbound {
+		return &model.Inbound{Protocol: model.AmneziaWG, Enable: enable, Settings: string(kernelSettings)}
+	}
+	cases := []struct {
+		name        string
+		enable      bool
+		old         *model.Inbound
+		wantRefused bool
+	}{
+		{"new inbound turns kernel mode on", true, nil, true},
+		{"embedded inbound switches to kernel mode", true, &model.Inbound{Protocol: model.AmneziaWG, Enable: true, Settings: string(embeddedSettings)}, true},
+		{"disabled kernel inbound is enabled", true, kernelRow(false), true},
+		{"running kernel inbound is edited", true, kernelRow(true), false},
+		{"running kernel inbound is disabled", false, kernelRow(true), false},
+		{"disabled inbound saved with kernel mode", false, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inbound := &model.Inbound{Protocol: model.AmneziaWG, Port: 51820, Enable: tc.enable, Settings: string(kernelSettings)}
+			err := (&InboundService{}).normalizeAmneziaWGSettings(inbound, tc.old)
+			if refused := err != nil && strings.Contains(err.Error(), "kernel mode unavailable"); refused != tc.wantRefused {
+				t.Fatalf("refused = %v (err %v), want %v", refused, err, tc.wantRefused)
+			}
+		})
+	}
+}
+
+func inboundForwardedPorts(t *testing.T, inboundSvc *InboundService, ibId int, email string) string {
+	t.Helper()
+	ib, err := inboundSvc.GetInbound(ibId)
+	if err != nil {
+		t.Fatalf("GetInbound %d: %v", ibId, err)
+	}
+	clients, err := inboundSvc.GetClients(ib)
+	if err != nil {
+		t.Fatalf("GetClients %d: %v", ibId, err)
+	}
+	for i := range clients {
+		if clients[i].Email == email {
+			return clients[i].ForwardedPortsSpec()
+		}
+	}
+	t.Fatalf("email %q not found on inbound %d", email, ibId)
+	return ""
+}
+
+// seedForwardedPortsClient attaches one AmneziaWG client already holding a
+// port forward, and returns its inbound and client-record id.
+func seedForwardedPortsClient(t *testing.T, email, forwardedPorts string) (*model.Inbound, int) {
+	t.Helper()
+	svc := &ClientService{}
+
+	seeded := model.Client{
+		Email:          email,
+		SubID:          "sub-" + email,
+		Enable:         true,
+		PublicKey:      "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=",
+		AllowedIPs:     []string{"10.8.1.2/32"},
+		ForwardedPorts: model.ForwardedPortsPtr(forwardedPorts),
+	}
+	ib := mkInbound(t, 51830, model.AmneziaWG, clientsSettings(t, []model.Client{seeded}))
+	if err := svc.SyncInbound(nil, ib.Id, []model.Client{seeded}); err != nil {
+		t.Fatalf("seed linkage: %v", err)
+	}
+	return ib, lookupClientRecord(t, email).Id
+}
+
+// The client form sends "" once the field was emptied. Carried forward like an
+// omitted field, the save was reported as done and the port stayed open.
+func TestUpdateCanWithdrawForwardedPorts(t *testing.T) {
+	setupBulkDB(t)
+	inboundSvc := &InboundService{}
+	svc := &ClientService{}
+
+	ib, recId := seedForwardedPortsClient(t, "fp@x", "8022")
+	if got := inboundForwardedPorts(t, inboundSvc, ib.Id, "fp@x"); got != "8022" {
+		t.Fatalf("seeded forwardedPorts = %q, want 8022", got)
+	}
+
+	updated := model.Client{
+		Email:          "fp@x",
+		Enable:         true,
+		AllowedIPs:     []string{"10.8.1.2/32"},
+		ForwardedPorts: model.ForwardedPortsPtr(""),
+	}
+	if _, err := svc.Update(inboundSvc, recId, updated, 0); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if got := inboundForwardedPorts(t, inboundSvc, ib.Id, "fp@x"); got != "" {
+		t.Fatalf("inbound forwardedPorts after an explicit \"\" = %q, want none", got)
+	}
+	stored, err := inboundSvc.GetInbound(ib.Id)
+	if err != nil {
+		t.Fatalf("GetInbound: %v", err)
+	}
+	if strings.Contains(stored.Settings, "forwardedPorts") {
+		t.Fatalf("withdrawn forwards must leave no key behind: %s", stored.Settings)
+	}
+	if got := lookupClientRecord(t, "fp@x").ForwardedPorts; got != "" {
+		t.Fatalf("stored wg_forwarded_ports after an explicit \"\" = %q, want none", got)
+	}
+}
+
+// The other half of the contract: a payload that never mentions forwardedPorts
+// (a metadata-only edit from the bot or the API) leaves the stored value alone.
+func TestUpdateWithoutForwardedPortsPreservesTheStoredValue(t *testing.T) {
+	setupBulkDB(t)
+	inboundSvc := &InboundService{}
+	svc := &ClientService{}
+
+	ib, recId := seedForwardedPortsClient(t, "fp@x", "8022")
+
+	updated := model.Client{
+		Email:      "fp@x",
+		Enable:     true,
+		AllowedIPs: []string{"10.8.1.2/32"},
+	}
+	if _, err := svc.Update(inboundSvc, recId, updated, 0); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if got := inboundForwardedPorts(t, inboundSvc, ib.Id, "fp@x"); got != "8022" {
+		t.Fatalf("inbound forwardedPorts after an edit that omitted it = %q, want 8022", got)
+	}
+	if got := lookupClientRecord(t, "fp@x").ForwardedPorts; got != "8022" {
+		t.Fatalf("stored wg_forwarded_ports after an edit that omitted it = %q, want 8022", got)
+	}
+}
+
+// The form is filled from the record, and the traffic resets re-save it: a record
+// left at the creation-time spec moves the forward back on the next save.
+func TestUpdateKeepsTheRecordsForwardedPortsCurrent(t *testing.T) {
+	setupBulkDB(t)
+	inboundSvc := &InboundService{}
+	svc := &ClientService{}
+
+	ib, recId := seedForwardedPortsClient(t, "fp@x", "8021")
+
+	updated := model.Client{
+		Email:          "fp@x",
+		Enable:         true,
+		AllowedIPs:     []string{"10.8.1.2/32"},
+		ForwardedPorts: model.ForwardedPortsPtr("8022"),
+	}
+	if _, err := svc.Update(inboundSvc, recId, updated, 0); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	rec := lookupClientRecord(t, "fp@x")
+	if rec.ForwardedPorts != "8022" {
+		t.Fatalf("stored wg_forwarded_ports after 8021 -> 8022 = %q, want 8022", rec.ForwardedPorts)
+	}
+
+	if _, err := svc.Update(inboundSvc, recId, *rec.ToClient(), 0); err != nil {
+		t.Fatalf("re-save of the record: %v", err)
+	}
+	if got := inboundForwardedPorts(t, inboundSvc, ib.Id, "fp@x"); got != "8022" {
+		t.Fatalf("inbound forwardedPorts after a re-save of the record = %q, want 8022", got)
 	}
 }

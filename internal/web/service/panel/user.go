@@ -2,6 +2,7 @@ package panel
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -34,6 +35,19 @@ func (s *UserService) GetFirstUser() (*model.User, error) {
 		return nil, err
 	}
 	return user, nil
+}
+
+// HasDefaultCredential reports that nobody has chosen the login yet: a database
+// holds no user before the first start, and an older one may still hold admin/admin.
+func (s *UserService) HasDefaultCredential() (bool, error) {
+	user, err := s.GetFirstUser()
+	if database.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return user.Username == "admin" && crypto.CheckPasswordHash(user.Password, "admin"), nil
 }
 
 func (s *UserService) CheckUser(username string, password string, twoFactorCode string) (*model.User, error) {
@@ -115,6 +129,9 @@ func (s *UserService) BumpLoginEpoch() error {
 }
 
 func (s *UserService) UpdateUser(id int, username string, password string) error {
+	if len(username) > MaxUsernameLength {
+		return fmt.Errorf("username can not be longer than %d bytes", MaxUsernameLength)
+	}
 	db := database.GetDB()
 	hashedPassword, err := crypto.HashPasswordAsBcrypt(password)
 	if err != nil {
@@ -144,6 +161,8 @@ func (s *UserService) UpdateUser(id int, username string, password string) error
 func (s *UserService) UpdateFirstUser(username string, password string) error {
 	if username == "" {
 		return errors.New("username can not be empty")
+	} else if len(username) > MaxUsernameLength {
+		return fmt.Errorf("username can not be longer than %d bytes", MaxUsernameLength)
 	} else if password == "" {
 		return errors.New("password can not be empty")
 	}
@@ -168,3 +187,7 @@ func (s *UserService) UpdateFirstUser(username string, password string) error {
 	user.LoginEpoch++
 	return db.Save(user).Error
 }
+
+// MaxUsernameLength bounds a panel username: the login route refuses longer names before
+// logging or recording them, so no stored name may exceed it.
+const MaxUsernameLength = 256

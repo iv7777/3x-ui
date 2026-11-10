@@ -80,7 +80,7 @@ func TestPanelResetsZeroSidecarQuota(t *testing.T) {
 	})
 	t.Run("inbound clients", func(t *testing.T) {
 		ib, logPath := startQuotaSidecar(t, 46207, model.Client{Enable: true})
-		if err := (&ClientService{}).ResetAllClientTraffics(&InboundService{}, ib.Id); err != nil {
+		if _, err := (&ClientService{}).ResetAllClientTraffics(&InboundService{}, ib.Id); err != nil {
 			t.Fatalf("ResetAllClientTraffics: %v", err)
 		}
 		if got := quotaResets(t, logPath); !slices.Equal(got, []string{"mtga", "mtgb"}) {
@@ -112,7 +112,7 @@ func TestPanelResetsZeroSidecarQuota(t *testing.T) {
 // sidecar's quota counters must stay too or clients get their quota again free.
 func TestInboundResetAllKeepsSidecarQuota(t *testing.T) {
 	_, logPath := startQuotaSidecar(t, 46204, model.Client{Enable: true})
-	if err := (&InboundService{}).ResetAllTraffics(); err != nil {
+	if _, err := (&InboundService{}).ResetAllTraffics(); err != nil {
 		t.Fatalf("ResetAllTraffics: %v", err)
 	}
 	if got := quotaResets(t, logPath); len(got) != 0 {
@@ -128,7 +128,7 @@ func TestInboundClientResetKeepsOtherSidecarQuotas(t *testing.T) {
 	if err := (&ClientService{}).SyncInbound(nil, other.Id, []model.Client{{Email: "vless-only", ID: "11111111-1111-1111-1111-1111111111ab", Enable: true}}); err != nil {
 		t.Fatalf("SyncInbound: %v", err)
 	}
-	if err := (&ClientService{}).ResetAllClientTraffics(&InboundService{}, other.Id); err != nil {
+	if _, err := (&ClientService{}).ResetAllClientTraffics(&InboundService{}, other.Id); err != nil {
 		t.Fatalf("ResetAllClientTraffics: %v", err)
 	}
 	if got := quotaResets(t, logPath); len(got) != 0 {

@@ -15,6 +15,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/database/dbtest"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/crypto"
+	"github.com/mhsanaei/3x-ui/v3/internal/web/locale"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/runtime"
 )
 
@@ -29,7 +30,11 @@ func TestNodeSyncPushSkipsOperatorTLSGuard(t *testing.T) {
 	runtime.SetManager(runtime.NewManager(runtime.LocalDeps{APIPort: func() int { return 0 }, SetNeedRestart: func() {}}))
 	t.Cleanup(func() { runtime.SetManager(prev) })
 
-	for name, scope := range map[string]string{"node-sync": model.ApiScopeNodeSync, "admin": model.ApiScopeAdmin} {
+	for name, scope := range map[string]string{
+		"node-sync":  model.ApiScopeNodeSync,
+		"node-admin": model.ApiScopeNodeAdmin,
+		"admin":      model.ApiScopeAdmin,
+	} {
 		row := &model.ApiToken{Name: name, Token: crypto.HashTokenSHA256(name + "-token"), Enabled: true, Scope: scope}
 		if err := database.GetDB().Create(row).Error; err != nil {
 			t.Fatalf("seed %s token: %v", name, err)
@@ -79,6 +84,16 @@ func TestNodeSyncPushSkipsOperatorTLSGuard(t *testing.T) {
 		}
 	})
 
+	t.Run("a node admin push keeps node sync semantics", func(t *testing.T) {
+		body := add(t, "node-admin-token", 45003)
+		if !strings.Contains(body, `"success":true`) {
+			t.Fatalf("node-admin add rejected: %s", body)
+		}
+		if got := rows(t, "tls-legacy-45003"); got != 1 {
+			t.Fatalf("stored rows = %d, want 1", got)
+		}
+	})
+
 	t.Run("an operator token is still held to the guard", func(t *testing.T) {
 		body := add(t, "admin-token", 45002)
 		if !strings.Contains(body, `"success":false`) || !strings.Contains(body, "TLS") {
@@ -88,4 +103,25 @@ func TestNodeSyncPushSkipsOperatorTLSGuard(t *testing.T) {
 			t.Fatalf("stored rows = %d, want 0", got)
 		}
 	})
+}
+
+// Each "{}" of the pushed list decodes into a whole traffic row, so a body under the size
+// cap could still cost the panel close to a gigabyte; the list is capped by entry count.
+func TestPushClientTrafficsCapsTheListByEntryCount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dbtest.InitDB(t, filepath.Join(t.TempDir(), "x-ui.db"))
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set("I18n", func(_ locale.I18nType, key string, _ ...string) string { return key })
+		c.Next()
+	})
+	NewInboundController(engine.Group("/panel/api/inbounds"))
+	body := `{"masterGuid":"m","traffics":[` + strings.TrimSuffix(strings.Repeat("{},", maxPushedClientTraffics+1), ",") + `]}`
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/inbounds/pushClientTraffics", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	if !strings.Contains(w.Body.String(), `"success":false`) {
+		t.Fatalf("an over-long traffic list was accepted: %.200s", w.Body.String())
+	}
 }

@@ -487,9 +487,6 @@ func (g *GatewayClient) sendStatus(ctx context.Context) {
 		hostname = "3x-ui"
 	}
 
-	days := status.Uptime / 86400
-	hours := (status.Uptime % 86400) / 3600
-
 	var onlines []string
 	if process := service.XrayProcess(); process != nil && process.IsRunning() {
 		onlines = process.GetOnlineClients()
@@ -515,7 +512,7 @@ func (g *GatewayClient) sendStatus(ctx context.Context) {
 		Fields: []EmbedField{
 			{Name: tr("discord.fields.panelVersion"), Value: config.GetPanelVersion(), Inline: true},
 			{Name: tr("discord.fields.xrayCore"), Value: fmt.Sprintf("%s (%s)", status.Xray.Version, status.Xray.State), Inline: true},
-			{Name: tr("pages.index.uptime"), Value: tr("discord.values.uptime", "Days=="+fmt.Sprint(days), "Hours=="+fmt.Sprint(hours)), Inline: true},
+			{Name: tr("pages.index.uptime"), Value: formatStatusUptime(status, tr), Inline: true},
 			{Name: tr("discord.fields.systemLoad"), Value: fmt.Sprintf("%.2f, %.2f, %.2f", load1, load2, load3), Inline: true},
 			{Name: tr("pages.index.memory"), Value: fmt.Sprintf("%s / %s", common.FormatTraffic(int64(status.Mem.Current)), common.FormatTraffic(int64(status.Mem.Total))), Inline: true},
 			{Name: tr("pages.index.historyTitleOnline"), Value: strconv.Itoa(len(onlines)), Inline: true},
@@ -613,8 +610,8 @@ func (g *GatewayClient) sendUsage(ctx context.Context, email string) {
 				}
 
 				embed := Embed{
-					Title:       tr("discord.commands.usageTitle", "Email=="+client.Email),
-					Description: tr("discord.commands.usageDescription", "Remark=="+in.Remark, "Port=="+strconv.Itoa(in.Port)),
+					Title:       tr("discord.commands.usageTitle", "Email=="+escapeMarkdown(client.Email)),
+					Description: tr("discord.commands.usageDescription", "Remark=="+escapeMarkdown(in.Remark), "Port=="+strconv.Itoa(in.Port)),
 					Color:       color,
 					Timestamp:   time.Now().UTC().Format(time.RFC3339),
 					Fields: []EmbedField{
@@ -662,15 +659,17 @@ func (g *GatewayClient) sendInbounds(ctx context.Context) {
 		if !in.Enable {
 			state = tr("disabled")
 		}
+		// The template puts the protocol in a code span, where a backslash escapes
+		// nothing and only a backtick gets out.
 		val := tr("discord.values.inbound",
-			"Protocol=="+string(in.Protocol),
+			"Protocol=="+strings.ReplaceAll(string(in.Protocol), "`", "'"),
 			"Port=="+strconv.Itoa(in.Port),
 			"Clients=="+strconv.Itoa(len(in.ClientStats)),
 			"Up=="+common.FormatTraffic(in.Up),
 			"Down=="+common.FormatTraffic(in.Down),
 			"State=="+state,
 		)
-		fields = append(fields, cleanField(fmt.Sprintf("📍 %s", in.Remark), val, false))
+		fields = append(fields, markupField(fmt.Sprintf("📍 %s", escapeMarkdown(in.Remark)), val, false))
 	}
 
 	title := tr("discord.commands.inboundsTitle")

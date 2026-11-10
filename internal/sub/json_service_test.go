@@ -155,6 +155,19 @@ func TestSubJsonServiceInjectsGlobalFinalMask(t *testing.T) {
 	}
 }
 
+// h2Params (xray-core 26.10.31, #7295) tunes the XHTTP server's HTTP/2; clients must not get it.
+func TestSubJsonServiceDropsXhttpServerOnlyH2Params(t *testing.T) {
+	svc := NewSubJsonService("", "", "", "", nil)
+	stream := svc.streamData(`{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","mode":"auto","h2Params":{"MaxConcurrentStreams":512}}}`, "")
+	xhttp, _ := stream["xhttpSettings"].(map[string]any)
+	if xhttp == nil || xhttp["path"] != "/x" {
+		t.Fatalf("xhttpSettings = %#v, want the inbound's path kept", stream["xhttpSettings"])
+	}
+	if h2, ok := xhttp["h2Params"]; ok {
+		t.Fatalf("xhttpSettings.h2Params = %#v, want the server-only key dropped", h2)
+	}
+}
+
 func TestSubJsonServiceMergesWithExistingFinalMask(t *testing.T) {
 	finalMask := `{"tcp":[{"type":"fragment","settings":{"packets":"tlshello"}}]}`
 	svc := NewSubJsonService("", "", finalMask, "", nil)
@@ -173,6 +186,27 @@ func TestSubJsonServiceMergesWithExistingFinalMask(t *testing.T) {
 	b, _ := tcp[1].(map[string]any)
 	if a["type"] != "sudoku" || b["type"] != "fragment" {
 		t.Fatalf("tcp masks = %#v, want existing sudoku then global fragment", tcp)
+	}
+}
+
+// The inbound "filter" mask (xray-core 26.10.21) screens the listener's source IPs: it would hand
+// clients the server's IP policy, and a client core older than it refuses the unknown type.
+func TestSubJsonServiceDropsTheServerOnlyFilterMask(t *testing.T) {
+	svc := NewSubJsonService("", "", "", "", nil)
+	stream := svc.streamData(`{"network":"kcp","security":"none","finalmask":{
+		"tcp":[{"type":"filter","settings":{"allowedSourceIPs":["10.0.0.0/8"]}}],
+		"udp":[{"type":"filter","settings":{"blockedSourceIPs":["geoip:cn"]}},{"type":"mkcp-legacy","settings":{"header":""}}]}}`, "")
+
+	finalmask, _ := stream["finalmask"].(map[string]any)
+	if _, ok := finalmask["tcp"]; ok {
+		t.Fatalf("finalmask.tcp = %#v, want it gone with its only mask", finalmask["tcp"])
+	}
+	udp, _ := finalmask["udp"].([]any)
+	if len(udp) != 1 {
+		t.Fatalf("finalmask.udp = %#v, want only the mkcp-legacy mask", udp)
+	}
+	if mask, _ := udp[0].(map[string]any); mask["type"] != "mkcp-legacy" {
+		t.Fatalf("finalmask.udp[0] = %#v, want mkcp-legacy", mask)
 	}
 }
 
@@ -499,7 +533,7 @@ func TestSubJsonServiceWireguard(t *testing.T) {
 		AllowedIPs:   []string{"10.0.0.2/32", "fd00::2/128"},
 	}
 
-	raw := NewSubJsonService("", "", "", "", nil).genWireguard(inbound, client)
+	raw := NewSubJsonService("", "", "", "", nil).genWireguard(&SubService{}, inbound, client)
 	if raw == nil {
 		t.Fatal("genWireguard returned nil for a valid wireguard client")
 	}
@@ -543,7 +577,7 @@ func TestSubJsonServiceWireguardNoKey(t *testing.T) {
 	inbound := &model.Inbound{Listen: "203.0.113.9", Port: 51820, Protocol: model.WireGuard, Settings: `{}`}
 	client := model.Client{Email: "user"}
 
-	if raw := NewSubJsonService("", "", "", "", nil).genWireguard(inbound, client); raw != nil {
+	if raw := NewSubJsonService("", "", "", "", nil).genWireguard(&SubService{}, inbound, client); raw != nil {
 		t.Fatalf("genWireguard = %s, want nil for a keyless wireguard client", raw)
 	}
 }

@@ -30,6 +30,7 @@ type BulkAttachResult struct {
 // all clients to a target in a single AddInboundClient call, and reports clients already
 // present on a target as skipped.
 func (s *ClientService) BulkAttach(inboundSvc *InboundService, emails []string, inboundIds []int) (*BulkAttachResult, bool, error) {
+	inboundIds = uniqueInts(inboundIds)
 	result := &BulkAttachResult{}
 	if len(emails) == 0 || len(inboundIds) == 0 {
 		return result, false, nil
@@ -111,6 +112,8 @@ func (s *ClientService) BulkAttach(inboundSvc *InboundService, emails []string, 
 				continue
 			}
 			client := *rec.ToClient()
+			// Forwards are set per inbound; see Attach.
+			client.ForwardedPorts = nil
 			if flow, ok := flowsByEmail[rec.Email]; ok && flow != "" {
 				client.Flow = flow
 			}
@@ -1047,6 +1050,7 @@ func (s *ClientService) bulkDelInboundClients(
 ) bulkInboundDeleteResult {
 	res := bulkInboundDeleteResult{perEmailSkipped: map[string]string{}}
 
+	defer InvalidateSubData()
 	defer lockInbound(inboundId).Unlock()
 
 	oldInbound, err := inboundSvc.GetInbound(inboundId)
@@ -1354,7 +1358,7 @@ func (s *ClientService) bulkCreate(inboundSvc *InboundService, payloads []Client
 		seenEmail[le] = struct{}{}
 		seenSubID[client.SubID] = le
 
-		prep = append(prep, prepared{client: client, inboundIds: payloads[i].InboundIds, limitHwid: payloads[i].LimitHwid, payloadIdx: i})
+		prep = append(prep, prepared{client: client, inboundIds: uniqueInts(payloads[i].InboundIds), limitHwid: payloads[i].LimitHwid, payloadIdx: i})
 		emails = append(emails, email)
 		subIDs = append(subIDs, client.SubID)
 	}
@@ -1505,9 +1509,6 @@ func (s *ClientService) bulkCreate(inboundSvc *InboundService, payloads []Client
 			skip(prep[idx].client.Email, reason[idx])
 			continue
 		}
-		// The client is already live after fanout; never leave a stale delete
-		// tombstone merely because applying its optional HWID limit failed.
-		withdrawClientTombstones(prep[idx].client.Email)
 		if err := s.setClientLimitHwidByEmail(prep[idx].client.Email, prep[idx].limitHwid); err != nil {
 			skip(prep[idx].client.Email, err.Error())
 			continue
@@ -1517,8 +1518,6 @@ func (s *ClientService) bulkCreate(inboundSvc *InboundService, payloads []Client
 			inserted = append(inserted, prep[idx].payloadIdx)
 		}
 	}
-	// A re-created email is a live identity again: a delete tombstone left
-	// standing makes the next node merge prune the new client's inbound links.
 	return result, inserted, needRestart, nil
 }
 
@@ -1537,8 +1536,9 @@ func (s *ClientService) DelDepleted(inboundSvc *InboundService) (int, bool, erro
 
 	seen := make(map[string]struct{}, len(rows))
 	emails := make([]string, 0, len(rows))
+	// BulkDelete trims each email, so a padded usage row would resolve to the client it resembles.
 	for _, r := range rows {
-		if r.Email == "" {
+		if r.Email == "" || r.Email != strings.TrimSpace(r.Email) {
 			continue
 		}
 		if _, ok := seen[r.Email]; ok {

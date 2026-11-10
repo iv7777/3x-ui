@@ -13,7 +13,7 @@ import {
 import type { AllSetting } from '@/models/setting';
 import { onNumber } from '@/utils/onNumber';
 import { SettingListItem } from '@/components/ui';
-import { GoRegexInput } from '@/components/form';
+import { GoRegexInput, selectTagRender } from '@/components/form';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { catTabLabel } from './catTabLabel';
 import { sanitizePath, normalizePath } from './uriPath';
@@ -158,7 +158,11 @@ export default function SubscriptionFormatsTab({
       items={[
         {
           key: '1',
-          label: catTabLabel(<SettingOutlined />, t('pages.settings.panelSettings'), isMobile),
+          label: catTabLabel(
+            <SettingOutlined aria-hidden />,
+            t('pages.settings.panelSettings'),
+            isMobile,
+          ),
           children: (
             <div className="subscription-format-sections">
               {allSetting.subJsonEnable && (
@@ -167,7 +171,7 @@ export default function SubscriptionFormatsTab({
                   className="subscription-format-card"
                   title={
                     <span className="subscription-format-card-title">
-                      <FileTextOutlined />
+                      <FileTextOutlined aria-hidden />
                       {t('pages.settings.subJsonEnableTitle')}
                     </span>
                   }
@@ -261,7 +265,7 @@ export default function SubscriptionFormatsTab({
                   className="subscription-format-card"
                   title={
                     <span className="subscription-format-card-title">
-                      <NodeIndexOutlined />
+                      <NodeIndexOutlined aria-hidden />
                       {t('pages.settings.subClashEnableTitle')}
                     </span>
                   }
@@ -322,7 +326,7 @@ export default function SubscriptionFormatsTab({
         {
           key: '2',
           label: catTabLabel(
-            <RocketOutlined />,
+            <RocketOutlined aria-hidden />,
             t('pages.settings.subFormats.finalMask'),
             isMobile,
           ),
@@ -342,7 +346,7 @@ export default function SubscriptionFormatsTab({
         },
         {
           key: '3',
-          label: catTabLabel(<PartitionOutlined />, t('pages.settings.mux'), isMobile),
+          label: catTabLabel(<PartitionOutlined aria-hidden />, t('pages.settings.mux'), isMobile),
           children: (
             <>
               <SettingListItem
@@ -396,7 +400,7 @@ export default function SubscriptionFormatsTab({
         },
         {
           key: '4',
-          label: catTabLabel(<SendOutlined />, t('pages.settings.direct'), isMobile),
+          label: catTabLabel(<SendOutlined aria-hidden />, t('pages.settings.direct'), isMobile),
           children: (
             <>
               <SettingListItem
@@ -414,6 +418,7 @@ export default function SubscriptionFormatsTab({
                   <SettingListItem paddings="small" title={<>{t('pages.settings.direct')} IPs</>}>
                     <Select
                       mode="tags"
+                      tagRender={selectTagRender}
                       value={ruleValues('direct', 'ip')}
                       style={{ width: '100%' }}
                       onChange={(v) => setRuleValues('direct', 'ip', DEFAULT_DIRECT_RULES[1], v)}
@@ -430,6 +435,7 @@ export default function SubscriptionFormatsTab({
                   >
                     <Select
                       mode="tags"
+                      tagRender={selectTagRender}
                       value={ruleValues('direct', 'domain')}
                       style={{ width: '100%' }}
                       onChange={(v) =>
@@ -445,7 +451,7 @@ export default function SubscriptionFormatsTab({
         },
         {
           key: '5',
-          label: catTabLabel(<StopOutlined />, t('pages.settings.block'), isMobile),
+          label: catTabLabel(<StopOutlined aria-hidden />, t('pages.settings.block'), isMobile),
           children: (
             <>
               <SettingListItem
@@ -463,6 +469,7 @@ export default function SubscriptionFormatsTab({
                   <SettingListItem paddings="small" title={t('pages.xray.blockdomains')}>
                     <Select
                       mode="tags"
+                      tagRender={selectTagRender}
                       value={ruleValues('block', 'domain')}
                       style={{ width: '100%' }}
                       onChange={(v) => setRuleValues('block', 'domain', DEFAULT_BLOCK_RULES[0], v)}
@@ -472,6 +479,7 @@ export default function SubscriptionFormatsTab({
                   <SettingListItem paddings="small" title={t('pages.xray.blockips')}>
                     <Select
                       mode="tags"
+                      tagRender={selectTagRender}
                       value={ruleValues('block', 'ip')}
                       style={{ width: '100%' }}
                       onChange={(v) => setRuleValues('block', 'ip', BLOCK_IP_RULE, v)}

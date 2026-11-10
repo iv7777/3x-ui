@@ -14,10 +14,18 @@ const (
 
 var errUdpAssociationClosed = errors.New("tuic: UDP association is closed")
 
+var errUserUdpRelayBudget = errors.New("tuic: the client has too many open UDP relays")
+
 type udpAssociation struct {
 	responseTransport uint8
 	relay             *udpRelaySession
 	lastActive        time.Time
+	opening           bool
+	openCancel        context.CancelFunc
+	// stopResponses ends the response relay, which may be blocked on stream credit the
+	// client never grants; closing the SOCKS side alone does not reach it.
+	stopResponses context.CancelFunc
+	pending       []pendingUdpPacket
 }
 
 type udpAssociationRegistry struct {
@@ -26,6 +34,8 @@ type udpAssociationRegistry struct {
 	datagramReassembler *packetReassembler
 	streamReassembler   *packetReassembler
 	maxPacketSize       int
+	pendingBytes        int
+	pendingBudget       *pendingUdpBudget
 }
 
 func newUdpAssociationRegistry(maxPacketSize int) *udpAssociationRegistry {
@@ -90,10 +100,16 @@ func (r *udpAssociationRegistry) ensureRelay(ctx context.Context, assocID uint16
 	}
 	r.mu.Unlock()
 
+	if user.udpRelays.Add(1) > maxUserUdpRelays {
+		user.udpRelays.Add(-1)
+		return nil, false, errUserUdpRelayBudget
+	}
 	socksSession, err := relay.DialUDP(ctx, user.Email)
 	if err != nil {
+		user.udpRelays.Add(-1)
 		return nil, false, err
 	}
+	socksSession.onClose = func() { user.udpRelays.Add(-1) }
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -115,6 +131,10 @@ func (r *udpAssociationRegistry) ensureRelay(ctx context.Context, assocID uint16
 func (r *udpAssociationRegistry) dissociate(assocID uint16) bool {
 	r.mu.Lock()
 	association := r.associations[assocID]
+	if association != nil {
+		r.clearPendingLocked(association)
+		association.stopResponsesLocked()
+	}
 	delete(r.associations, assocID)
 	r.datagramReassembler.clearAssociation(assocID)
 	r.streamReassembler.clearAssociation(assocID)
@@ -151,6 +171,8 @@ func (r *udpAssociationRegistry) expireLocked(now time.Time) {
 			continue
 		}
 		delete(r.associations, assocID)
+		r.clearPendingLocked(association)
+		association.stopResponsesLocked()
 		r.datagramReassembler.clearAssociation(assocID)
 		r.streamReassembler.clearAssociation(assocID)
 		if association.relay != nil {
@@ -162,6 +184,8 @@ func (r *udpAssociationRegistry) expireLocked(now time.Time) {
 func (r *udpAssociationRegistry) closeAll() {
 	r.mu.Lock()
 	for _, association := range r.associations {
+		r.clearPendingLocked(association)
+		association.stopResponsesLocked()
 		if association.relay != nil {
 			_ = association.relay.relay.Close()
 		}
@@ -175,6 +199,8 @@ func (r *udpAssociationRegistry) closeAll() {
 func (r *udpAssociationRegistry) release(id uint16, expected *udpAssociation) {
 	r.mu.Lock()
 	if r.associations[id] == expected {
+		r.clearPendingLocked(expected)
+		expected.stopResponsesLocked()
 		delete(r.associations, id)
 		r.datagramReassembler.clearAssociation(id)
 		r.streamReassembler.clearAssociation(id)
@@ -182,5 +208,23 @@ func (r *udpAssociationRegistry) release(id uint16, expected *udpAssociation) {
 	r.mu.Unlock()
 	if expected.relay != nil {
 		_ = expected.relay.relay.Close()
+	}
+}
+
+// attachResponseStop records the response relay's cancel on a live association; false
+// means the association is already gone and the relay must not start.
+func (r *udpAssociationRegistry) attachResponseStop(assocID uint16, expected *udpAssociation, stop context.CancelFunc) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.associations[assocID] != expected {
+		return false
+	}
+	expected.stopResponses = stop
+	return true
+}
+
+func (a *udpAssociation) stopResponsesLocked() {
+	if a.stopResponses != nil {
+		a.stopResponses()
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/web/websocket"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func notifyClientsChanged() {
@@ -52,7 +53,9 @@ func NewClientController(g *gin.RouterGroup) *ClientController {
 func (a *ClientController) initRouter(g *gin.RouterGroup) {
 	g.GET("/list", a.list)
 	g.GET("/list/paged", a.listPaged)
+	g.GET("/get", a.get)
 	g.GET("/get/:email", a.get)
+	g.GET("/get/subId/:subId", a.getBySubId)
 	g.GET("/get/tgId/:tgId", a.getByTgId)
 	g.GET("/traffic/:email", a.getTrafficByEmail)
 	g.GET("/subLinks/:subId", a.getSubLinks)
@@ -61,7 +64,9 @@ func (a *ClientController) initRouter(g *gin.RouterGroup) {
 
 	g.POST("/add", a.create)
 	g.POST("/renewalPreview", a.renewalPreview)
+	g.POST("/update", a.update)
 	g.POST("/update/:email", a.update)
+	g.POST("/del", a.delete)
 	g.POST("/del/:email", a.delete)
 	g.POST("/:email/attach", a.attach)
 	g.POST("/:email/detach", a.detach)
@@ -157,8 +162,24 @@ func (a *ClientController) buildClientPayload(rec *model.ClientRecord) (gin.H, e
 	}, nil
 }
 
-func (a *ClientController) get(c *gin.Context) {
+// Query aliases keep legacy dot-segment names addressable without changing path clients.
+func clientEmailParam(c *gin.Context) (string, bool) {
 	email := c.Param("email")
+	if email == "" {
+		email = c.Query("email")
+	}
+	if email == "" {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), errors.New("client email is required"))
+		return "", false
+	}
+	return email, true
+}
+
+func (a *ClientController) get(c *gin.Context) {
+	email, ok := clientEmailParam(c)
+	if !ok {
+		return
+	}
 	rec, err := a.clientService.GetRecordByEmail(nil, email)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.obtain"), err)
@@ -170,6 +191,27 @@ func (a *ClientController) get(c *gin.Context) {
 		return
 	}
 	jsonObj(c, payload, nil)
+}
+
+func (a *ClientController) getBySubId(c *gin.Context) {
+	records, err := a.clientService.GetRecordsBySubID(c.Param("subId"))
+	if err == nil && len(records) == 0 {
+		err = gorm.ErrRecordNotFound
+	}
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.obtain"), err)
+		return
+	}
+	results := make([]gin.H, 0, len(records))
+	for _, rec := range records {
+		payload, err := a.buildClientPayload(rec)
+		if err != nil {
+			jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.obtain"), err)
+			return
+		}
+		results = append(results, payload)
+	}
+	jsonObj(c, results, nil)
 }
 
 func (a *ClientController) getByTgId(c *gin.Context) {
@@ -221,17 +263,17 @@ func (a *ClientController) create(c *gin.Context) {
 }
 
 func (a *ClientController) update(c *gin.Context) {
-	email := c.Param("email")
-	var req struct {
-		model.Client
-		LimitHwid int `json:"limitHwid"`
+	email, ok := clientEmailParam(c)
+	if !ok {
+		return
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
+	body, err := c.GetRawData()
+	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
 	inboundFilter := parseInboundIdsQuery(c.Query("inboundIds"))
-	needRestart, err := a.clientService.UpdateByEmail(&a.inboundService, email, req.Client, req.LimitHwid, inboundFilter...)
+	needRestart, err := a.clientService.UpdateByEmailJSON(&a.inboundService, email, body, inboundFilter...)
 	// Flagged before the error check: a partly-applied edit leaves the change
 	// committed on the inbounds that succeeded, and those still need the restart.
 	if needRestart {
@@ -250,7 +292,10 @@ func (a *ClientController) update(c *gin.Context) {
 }
 
 func (a *ClientController) delete(c *gin.Context) {
-	email := c.Param("email")
+	email, ok := clientEmailParam(c)
+	if !ok {
+		return
+	}
 	keepTraffic := c.Query("keepTraffic") == "1"
 	needRestart, err := a.clientService.DeleteByEmail(&a.inboundService, email, keepTraffic)
 	// Flagged before the error check: a partly-applied delete already removed

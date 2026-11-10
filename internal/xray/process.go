@@ -227,6 +227,8 @@ var (
 	xrayVersionTimeout      = 5 * time.Second
 	// OnCrash is called when xray crashes unexpectedly. Set from web layer.
 	OnCrash func(err error)
+	// ErrXrayNotRunning reports an operation that requires a running core when xray is stopped.
+	ErrXrayNotRunning = errors.New("xray is not running")
 )
 
 // newProcess creates a new internal process struct for Xray.
@@ -243,6 +245,9 @@ func newProcess(config *Config) *process {
 func newTestProcess(config *Config, configPath string) *process {
 	p := newProcess(config)
 	p.configPath = configPath
+	if config != nil {
+		p.refreshAPIPort()
+	}
 	return p
 }
 
@@ -590,6 +595,43 @@ func (p *process) refreshAPIPort() {
 	p.mu.Unlock()
 }
 
+// xrayCheckTimeout bounds `run -test`, which loads the config and its geo files but opens
+// no listeners, so it can run while the live core holds the ports.
+const xrayCheckTimeout = 30 * time.Second
+
+// CheckConfig runs the core at binaryPath in test mode against cfg. Updates call it first,
+// so a core that rejects cfg never replaces the running one.
+func CheckConfig(binaryPath string, cfg *Config) error {
+	// The test run builds every outbound. A kernel-TUN WireGuard one would add a second wg
+	// device and IPv6 policy rules to the host, and the run exits without removing the rules.
+	checked := *cfg
+	checked.OutboundConfigs, _ = ForceUserspaceWireGuardTun(cfg.OutboundConfigs)
+	data, err := json.Marshal(&checked)
+	if err != nil {
+		return err
+	}
+	// CreateTemp creates the file as 0600; the config holds client credentials.
+	file, err := os.CreateTemp(filepath.Dir(binaryPath), ".config-check-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	_, err = file.Write(data)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), xrayCheckTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, binaryPath, "run", "-test", "-c", file.Name()).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
+	}
+	return nil
+}
+
 // refreshVersion updates the version string by running the Xray binary with -version.
 func (p *process) refreshVersion() {
 	version := "Unknown"
@@ -758,7 +800,7 @@ func (p *process) waitForCommand(cmd *exec.Cmd, done chan struct{}) {
 // Stop terminates the running Xray process.
 func (p *process) Stop() error {
 	if !p.IsRunning() {
-		return errors.New("xray is not running")
+		return ErrXrayNotRunning
 	}
 	p.intentionalStop.Store(true)
 
@@ -768,7 +810,7 @@ func (p *process) Stop() error {
 	cmd := p.cmd
 	p.mu.RUnlock()
 	if cmd == nil || cmd.Process == nil {
-		return errors.New("xray is not running")
+		return ErrXrayNotRunning
 	}
 
 	// Remove temporary config file used for test runs so main config is never touched

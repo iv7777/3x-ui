@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Alert, Button, Form, Input, Modal, Select, Space, Spin, Typography, message } from 'antd';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
@@ -19,8 +19,8 @@ interface GeodataSectionProps {
 }
 
 const DEFAULT_CRON = '0 4 * * *';
-// Xray resolves `file` inside its asset directory; plain file names only.
-const FILE_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+// Xray resolves `file` inside its asset directory; since 26.10.29 a scheduled one must be .dat.
+const FILE_NAME_PATTERN = /^[A-Za-z0-9._-]+\.dat$/i;
 
 function fileNameFromUrl(url: string): string {
   try {
@@ -33,6 +33,7 @@ function fileNameFromUrl(url: string): string {
 
 export default function GeodataSection({ active, onBusy, onClose }: GeodataSectionProps) {
   const { t } = useTranslation();
+  const uid = useId();
   const [modal, modalContextHolder] = Modal.useModal();
   const [messageApi, messageContextHolder] = message.useMessage();
   const [loading, setLoading] = useState(false);
@@ -177,18 +178,28 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
     <div>
       {modalContextHolder}
       {messageContextHolder}
-      <Spin spinning={loading}>
+      <Spin aria-live="off" spinning={loading}>
         <Alert type="info" className="mb-12" title={t('pages.index.geodataHint')} showIcon />
         <Form layout="vertical">
-          <Form.Item label={t('pages.index.geodataCron')} style={{ marginBottom: 8 }}>
+          <Form.Item
+            htmlFor={`${uid}-cron`}
+            label={t('pages.index.geodataCron')}
+            style={{ marginBottom: 8 }}
+          >
             <Input
+              id={`${uid}-cron`}
               value={cron}
               placeholder={DEFAULT_CRON}
               onChange={(e) => setCron(e.target.value)}
             />
           </Form.Item>
-          <Form.Item label={t('pages.index.geodataOutbound')} style={{ marginBottom: 8 }}>
+          <Form.Item
+            htmlFor={`${uid}-outbound`}
+            label={t('pages.index.geodataOutbound')}
+            style={{ marginBottom: 8 }}
+          >
             <Select
+              id={`${uid}-outbound`}
               style={{ width: '100%' }}
               allowClear
               value={outbound}
@@ -204,6 +215,7 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
           {rows.map((row, i) => (
             <Space.Compact key={i} style={{ width: '100%' }}>
               <Input
+                aria-label={`URL ${i + 1}`}
                 style={{ width: '60%' }}
                 placeholder="https://example.com/geosite_custom.dat"
                 value={row.url}
@@ -211,6 +223,7 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
                 onBlur={() => onUrlBlur(i)}
               />
               <Input
+                aria-label={`${t('pages.index.geodataFile')} ${i + 1}`}
                 style={{ width: '40%' }}
                 placeholder={t('pages.index.geodataFile')}
                 value={row.file}
@@ -218,14 +231,14 @@ export default function GeodataSection({ active, onBusy, onClose }: GeodataSecti
               />
               <Button
                 aria-label={t('delete')}
-                icon={<DeleteOutlined />}
+                icon={<DeleteOutlined aria-hidden />}
                 onClick={() => setRows((p) => p.filter((_, j) => j !== i))}
               />
             </Space.Compact>
           ))}
           <div className="actions-row">
             <Button
-              icon={<PlusOutlined />}
+              icon={<PlusOutlined aria-hidden />}
               onClick={() => setRows((p) => [...p, { url: '', file: '' }])}
             >
               {t('pages.index.geodataAddFile')}

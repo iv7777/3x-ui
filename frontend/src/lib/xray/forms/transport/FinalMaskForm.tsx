@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
+import { NativeSelect } from '@/components/form/NativeSelect';
+import { useEffect, useId, useRef, useState } from 'react';
 import {
   AutoComplete,
   Button,
@@ -16,9 +17,11 @@ import { useTranslation } from 'react-i18next';
 import type { FormInstance } from 'antd/es/form';
 import type { NamePath } from 'antd/es/form/interface';
 
+import { selectTagRender } from '@/components/form/SelectTag';
 import { RandomUtil } from '@/utils';
 import { activateOnKey } from '@/utils/a11y';
 import { OutboundProtocols, UTLS_FINGERPRINT } from '@/schemas/primitives';
+import { TCP_MASK_PRESETS } from '@/lib/xray/finalmask-presets';
 import { upgradeLegacyUdpHop } from '@/lib/xray/udphop-mask';
 import { upgradeLegacyXdnsMasks, XDNS_LEGACY_EDNS0 } from '@/lib/xray/xdns-mask';
 
@@ -36,8 +39,8 @@ export interface FinalMaskFormProps {
   // network/protocol. Used by the global sub-JSON finalmask editor where
   // the masks apply to every stream rather than one specific transport.
   showAll?: boolean;
-  // udphop runs only on the dialing side (the core refuses it on a listener), so a server
-  // keeps the advertised hop range in quicParams.udpHop and a client gets the mask.
+  // udphop runs only on the dialing side (the core refuses it on a listener), so a server keeps
+  // the advertised hop range in quicParams.udpHop; filter is the listener-only counterpart.
   side?: 'server' | 'client';
 }
 
@@ -271,6 +274,7 @@ export default function FinalMaskForm({
   showAll = false,
   side = 'client',
 }: FinalMaskFormProps) {
+  const uid = useId();
   const base = asPath(name);
 
   // Migrate legacy mask shapes once on mount so configs saved before #6334 (fragment
@@ -332,7 +336,14 @@ export default function FinalMaskForm({
 
   return (
     <>
-      {showTcp && <TcpMasksList base={base} form={form} />}
+      {showTcp && (
+        <TcpMasksList
+          base={base}
+          form={form}
+          allowFilter={side === 'server'}
+          allowPresets={side === 'client'}
+        />
+      )}
       {showUdp && (
         <UdpMasksList
           base={base}
@@ -341,12 +352,14 @@ export default function FinalMaskForm({
           isWireguard={isWireguard}
           network={network}
           allowUdpHop={side === 'client'}
+          allowFilter={side === 'server'}
         />
       )}
       {showQuic && (
         <>
-          <Form.Item label="QUIC Params">
+          <Form.Item label="QUIC Params" htmlFor={`${uid}-quic-params`}>
             <Switch
+              id={`${uid}-quic-params`}
               checked={hasQuicParams}
               onChange={(v) => {
                 form.setFieldValue([...base, 'quicParams'], v ? defaultQuicParams() : undefined);
@@ -366,22 +379,52 @@ export default function FinalMaskForm({
   );
 }
 
-function TcpMasksList({ base, form }: { base: (string | number)[]; form: FormInstance }) {
+function TcpMasksList({
+  base,
+  form,
+  allowFilter,
+  allowPresets,
+}: {
+  base: (string | number)[];
+  form: FormInstance;
+  allowFilter: boolean;
+  allowPresets: boolean;
+}) {
   const { t } = useTranslation();
+  const uid = useId();
   return (
     <Form.List name={[...base, 'tcp']}>
       {(fields, { add, remove }) => (
         <>
           <Form.Item label="TCP Masks">
-            <Button
-              type="primary"
-              size="small"
-              icon={<PlusOutlined />}
-              aria-label={t('add')}
-              onClick={() =>
-                add({ type: 'fragment', settings: defaultTcpMaskSettings('fragment') })
-              }
-            />
+            <Space>
+              <Button
+                type="primary"
+                size="small"
+                icon={<PlusOutlined aria-hidden />}
+                aria-label={t('add')}
+                onClick={() =>
+                  add({ type: 'fragment', settings: defaultTcpMaskSettings('fragment') })
+                }
+              />
+              {allowPresets && (
+                <NativeSelect
+                  id={`${uid}-tcp-presets`}
+                  size="small"
+                  style={{ minWidth: 160 }}
+                  aria-label={t('pages.inbounds.form.presets')}
+                  placeholder={t('pages.inbounds.form.presets')}
+                  value={null}
+                  options={Object.keys(TCP_MASK_PRESETS).map((name) => ({
+                    value: name,
+                    label: name,
+                  }))}
+                  onChange={(name: string) =>
+                    form.setFieldValue([...base, 'tcp'], structuredClone(TCP_MASK_PRESETS[name]))
+                  }
+                />
+              )}
+            </Space>
           </Form.Item>
           {fields.map((field, mIdx) => (
             <TcpMaskItem
@@ -390,6 +433,7 @@ function TcpMasksList({ base, form }: { base: (string | number)[]; form: FormIns
               displayIndex={mIdx + 1}
               form={form}
               listPath={[...base, 'tcp']}
+              allowFilter={allowFilter}
               onRemove={() => remove(field.name)}
             />
           ))}
@@ -404,12 +448,14 @@ function TcpMaskItem({
   displayIndex,
   form,
   listPath,
+  allowFilter,
   onRemove,
 }: {
   fieldName: number;
   displayIndex: number;
   form: FormInstance;
   listPath: (string | number)[];
+  allowFilter: boolean;
   onRemove: () => void;
 }) {
   // Absolute path for setFieldValue side effects (resetting settings on
@@ -433,7 +479,7 @@ function TcpMaskItem({
       </Divider>
 
       <Form.Item label="Type" name={[fieldName, 'type']}>
-        <Select
+        <NativeSelect
           onChange={(v) =>
             form.setFieldValue([...absolutePath, 'settings'], defaultTcpMaskSettings(v))
           }
@@ -442,6 +488,7 @@ function TcpMaskItem({
             { value: 'header-custom', label: 'Header Custom' },
             { value: 'sudoku', label: 'Sudoku' },
             { value: 'xmc', label: 'XMC (Minecraft)' },
+            ...(allowFilter ? [FILTER_MASK_OPTION] : []),
           ]}
         />
       </Form.Item>
@@ -493,6 +540,7 @@ function TcpMaskItem({
             );
           }
           if (type === 'sudoku') return <SudokuSettings fieldName={fieldName} />;
+          if (type === 'filter') return <FilterMaskSettings fieldName={fieldName} />;
           if (type === 'header-custom') {
             return (
               <HeaderCustomGroups
@@ -517,12 +565,13 @@ function TcpMaskItem({
                       rules={[{ required: true, message: 'Password is required' }]}
                     >
                       <Input
+                        aria-label="Password"
                         placeholder="Obfuscation password"
                         style={{ width: 'calc(100% - 32px)' }}
                       />
                     </Form.Item>
                     <Button
-                      icon={<ReloadOutlined />}
+                      icon={<ReloadOutlined aria-hidden />}
                       aria-label={t('regenerate')}
                       onClick={() =>
                         form.setFieldValue(
@@ -543,6 +592,54 @@ function TcpMaskItem({
   );
 }
 
+const FILTER_MASK_OPTION = { value: 'filter', label: 'Filter (source IPs)' };
+const FILTER_ALLOWED_HINT = 'Only these sources may connect; empty allows every source';
+const FILTER_BLOCKED_HINT = 'These sources are dropped before any other mask runs';
+
+// xray-core 26.10.21 (#7206) screens a listener's source IPs; a blocked match wins over an allowed
+// one, and an empty list leaves that side open. Links and JSON subscriptions drop it.
+function FilterMaskSettings({ fieldName }: { fieldName: number }) {
+  const uid = useId();
+  return (
+    <>
+      <Form.Item
+        label="Allowed Source IPs"
+        name={[fieldName, 'settings', 'allowedSourceIPs']}
+        tooltip={FILTER_ALLOWED_HINT}
+      >
+        <Select
+          aria-describedby={`${uid}-allowed-hint`}
+          mode="tags"
+          tagRender={selectTagRender}
+          style={{ width: '100%' }}
+          tokenSeparators={[',', ' ']}
+          placeholder="10.0.0.0/8, geoip:ir"
+        />
+      </Form.Item>
+      <span id={`${uid}-allowed-hint`} hidden>
+        {FILTER_ALLOWED_HINT}
+      </span>
+      <Form.Item
+        label="Blocked Source IPs"
+        name={[fieldName, 'settings', 'blockedSourceIPs']}
+        tooltip={FILTER_BLOCKED_HINT}
+      >
+        <Select
+          aria-describedby={`${uid}-blocked-hint`}
+          mode="tags"
+          tagRender={selectTagRender}
+          style={{ width: '100%' }}
+          tokenSeparators={[',', ' ']}
+          placeholder="203.0.113.7, geoip:cn"
+        />
+      </Form.Item>
+      <span id={`${uid}-blocked-hint`} hidden>
+        {FILTER_BLOCKED_HINT}
+      </span>
+    </>
+  );
+}
+
 function SudokuSettings({ fieldName }: { fieldName: number }) {
   return (
     <>
@@ -556,7 +653,12 @@ function SudokuSettings({ fieldName }: { fieldName: number }) {
         <Input />
       </Form.Item>
       <Form.Item label="Custom Tables" name={[fieldName, 'settings', 'customTables']}>
-        <Select mode="tags" style={{ width: '100%' }} tokenSeparators={[',']} />
+        <Select
+          mode="tags"
+          tagRender={selectTagRender}
+          style={{ width: '100%' }}
+          tokenSeparators={[',']}
+        />
       </Form.Item>
       <Form.Item label="Padding Min" name={[fieldName, 'settings', 'paddingMin']}>
         <InputNumber min={0} />
@@ -578,15 +680,15 @@ function validateFragmentPackets(_rule: unknown, value: unknown): Promise<void> 
   return Promise.reject(new Error('Use "tlshello" or a packet range like 1-3'));
 }
 
-function validateFragmentLength(_rule: unknown, value: unknown): Promise<void> {
+// xray refuses only a 0 minimum in the LAST lengths entry; an earlier 0 is an
+// empty segment, which PattN's tlshello-0-len preset relies on.
+function validateFragmentLength(_rule: unknown, value: unknown, isLast: boolean): Promise<void> {
   const str = typeof value === 'string' ? value.trim() : String(value ?? '').trim();
   if (str.length === 0) {
-    return Promise.reject(
-      new Error('Length is required — xray rejects a fragment mask whose LengthMin is 0'),
-    );
+    return Promise.reject(new Error('Length is required — remove the row if you do not need it'));
   }
   const min = Number(str.split('-')[0]);
-  if (!Number.isFinite(min) || min <= 0) {
+  if (!Number.isFinite(min) || min < 0 || (isLast && min === 0)) {
     return Promise.reject(new Error('Length minimum must be greater than 0 (e.g. 100-200)'));
   }
   return Promise.resolve();
@@ -622,7 +724,7 @@ function FragmentRangeList({
   listName: (string | number)[];
   label: string;
   placeholder: string;
-  validator?: (rule: unknown, value: unknown) => Promise<void>;
+  validator?: (rule: unknown, value: unknown, isLast: boolean) => Promise<void>;
   minItems?: number;
 }) {
   const { t } = useTranslation();
@@ -634,7 +736,7 @@ function FragmentRangeList({
             <Button
               type="primary"
               size="small"
-              icon={<PlusOutlined />}
+              icon={<PlusOutlined aria-hidden />}
               aria-label={t('add')}
               onClick={() => add('')}
             />
@@ -644,7 +746,11 @@ function FragmentRangeList({
               key={field.key}
               label={`#${idx + 1}`}
               name={field.name}
-              rules={validator ? [{ validator }] : undefined}
+              rules={
+                validator
+                  ? [{ validator: (r, v) => validator(r, v, idx === fields.length - 1) }]
+                  : undefined
+              }
             >
               <Input
                 placeholder={placeholder}
@@ -727,7 +833,7 @@ function XmcProfilesList({ tcpFieldName }: { tcpFieldName: number }) {
             <Button
               type="primary"
               size="small"
-              icon={<PlusOutlined />}
+              icon={<PlusOutlined aria-hidden />}
               aria-label={t('add')}
               onClick={() => add(defaultXmcProfile())}
             />
@@ -797,6 +903,21 @@ const HEADER_CUSTOM_TCP_GROUPS = [
   },
 ] as const;
 
+const UDP_MODE_HINT =
+  'Prefix puts the header on every packet; Standalone exchanges it as separate handshake packets first';
+const NOISE_RESET_HINT = 'Seconds before the noise is sent to a destination again; 0 sends it once';
+const NOISE_SCRIPT_HINT =
+  'A Lua file xray-core runs to build the noise, found beside the xray binary; replaces the noise list';
+const DOH_TLS_HINT =
+  'tlsSettings for the https:// addresses, e.g. a serverName to front the domain';
+const DOH_QUIC_HINT = 'QUIC parameters for an https:// address reached over h3';
+const REUSE_HINT = 'Writes the bytes an earlier item captured under this name';
+const TRANSFORM_HINT =
+  'An expression tree, e.g. {"op": "concat", "args": [{"type": "str", "bytes": "OK "}, {"reuse": "nonce"}]}';
+const CAPTURE_HINT = 'Saves the bytes this item writes or reads under a name later items can reuse';
+const UDP_HOP_HINT =
+  'Advertised to clients as a hop range; the server listens on its own port only';
+
 function HeaderCustomGroups({
   tcpFieldName,
   form,
@@ -807,6 +928,7 @@ function HeaderCustomGroups({
   absoluteSettingsPath: (string | number)[];
 }) {
   const { t } = useTranslation();
+  const uid = useId();
   return (
     <>
       {HEADER_CUSTOM_TCP_GROUPS.map(({ key: groupKey, label, tooltip }) => (
@@ -817,10 +939,14 @@ function HeaderCustomGroups({
                 <Button
                   type="primary"
                   size="small"
-                  icon={<PlusOutlined />}
+                  icon={<PlusOutlined aria-hidden />}
                   aria-label={t('add')}
+                  aria-describedby={`${uid}-${groupKey}-hint`}
                   onClick={() => addGroup([defaultClientServerItem()])}
                 />
+                <span id={`${uid}-${groupKey}-hint`} hidden>
+                  {tooltip}
+                </span>
               </Form.Item>
               {groups.map((group, gi) => (
                 <div key={group.key}>
@@ -841,7 +967,7 @@ function HeaderCustomGroups({
                         <Form.Item label="Items">
                           <Button
                             size="small"
-                            icon={<PlusOutlined />}
+                            icon={<PlusOutlined aria-hidden />}
                             aria-label={t('add')}
                             onClick={() => addItem(defaultClientServerItem())}
                           />
@@ -882,6 +1008,7 @@ function UdpMasksList({
   isWireguard,
   network,
   allowUdpHop,
+  allowFilter,
 }: {
   base: (string | number)[];
   form: FormInstance;
@@ -889,6 +1016,7 @@ function UdpMasksList({
   isWireguard: boolean;
   network: string;
   allowUdpHop: boolean;
+  allowFilter: boolean;
 }) {
   const { t } = useTranslation();
   return (
@@ -899,7 +1027,7 @@ function UdpMasksList({
             <Button
               type="primary"
               size="small"
-              icon={<PlusOutlined />}
+              icon={<PlusOutlined aria-hidden />}
               aria-label={t('add')}
               onClick={() => {
                 const def = isHysteria || isWireguard ? 'salamander' : 'mkcp-legacy';
@@ -918,6 +1046,7 @@ function UdpMasksList({
               isWireguard={isWireguard}
               network={network}
               allowUdpHop={allowUdpHop}
+              allowFilter={allowFilter}
               onRemove={() => remove(field.name)}
             />
           ))}
@@ -936,6 +1065,7 @@ function UdpMaskItem({
   isWireguard,
   network,
   allowUdpHop,
+  allowFilter,
   onRemove,
 }: {
   fieldName: number;
@@ -946,6 +1076,7 @@ function UdpMaskItem({
   isWireguard: boolean;
   network: string;
   allowUdpHop: boolean;
+  allowFilter: boolean;
   onRemove: () => void;
 }) {
   const absolutePath = [...listPath, fieldName];
@@ -960,8 +1091,9 @@ function UdpMaskItem({
   };
 
   const udpHopOption = allowUdpHop ? [{ value: 'udphop', label: 'UDP Hop' }] : [];
+  const filterOption = allowFilter ? [FILTER_MASK_OPTION] : [];
   const options = isHysteria
-    ? [{ value: 'salamander', label: 'Salamander (Hysteria2)' }, ...udpHopOption]
+    ? [{ value: 'salamander', label: 'Salamander (Hysteria2)' }, ...udpHopOption, ...filterOption]
     : [
         // Salamander is the mask xray-core's own wireguard finalmask example
         // uses; it stays hysteria-only elsewhere to keep legacy parity.
@@ -974,6 +1106,7 @@ function UdpMaskItem({
         { value: 'noise', label: 'Noise' },
         { value: 'sudoku', label: 'Sudoku' },
         ...udpHopOption,
+        ...filterOption,
       ];
 
   return (
@@ -991,7 +1124,7 @@ function UdpMaskItem({
       </Divider>
 
       <Form.Item label="Type" name={[fieldName, 'type']}>
-        <Select onChange={onTypeChange} options={options} />
+        <NativeSelect onChange={onTypeChange} options={options} />
       </Form.Item>
 
       <Form.Item
@@ -1015,7 +1148,7 @@ function UdpMaskItem({
             return (
               <>
                 <Form.Item label="Header" name={[fieldName, 'settings', 'header']}>
-                  <Select
+                  <NativeSelect
                     options={[
                       { value: '', label: 'Original / AES-128-GCM' },
                       { value: 'dns', label: 'DNS' },
@@ -1039,6 +1172,7 @@ function UdpMaskItem({
           if (type === 'udphop') {
             return <UdpHopSettings udpFieldName={fieldName} />;
           }
+          if (type === 'filter') return <FilterMaskSettings fieldName={fieldName} />;
           if (type === 'xicmp') {
             return (
               <>
@@ -1050,7 +1184,12 @@ function UdpMaskItem({
                   <Switch />
                 </Form.Item>
                 <Form.Item label="IPs" name={[fieldName, 'settings', 'ips']}>
-                  <Select mode="tags" style={{ width: '100%' }} tokenSeparators={[',']} />
+                  <Select
+                    mode="tags"
+                    tagRender={selectTagRender}
+                    style={{ width: '100%' }}
+                    tokenSeparators={[',']}
+                  />
                 </Form.Item>
               </>
             );
@@ -1064,6 +1203,7 @@ function UdpMaskItem({
                 <Form.Item label="STUN Servers" name={[fieldName, 'settings', 'stunServers']}>
                   <Select
                     mode="tags"
+                    tagRender={selectTagRender}
                     style={{ width: '100%' }}
                     tokenSeparators={[',']}
                     placeholder="host:port"
@@ -1111,6 +1251,7 @@ function UdpMaskItem({
                 <Form.Item label="ALPN" name={[fieldName, 'settings', 'tlsConfig', 'alpn']}>
                   <Select
                     mode="multiple"
+                    tagRender={selectTagRender}
                     style={{ width: '100%' }}
                     options={[
                       { value: 'h3', label: 'h3' },
@@ -1171,6 +1312,7 @@ function SalamanderUdpMaskSettings({
   absolutePath: (string | number)[];
 }) {
   const { t } = useTranslation();
+  const uid = useId();
   const packetSizePath = [...absolutePath, 'settings', 'packetSize'];
   const packetSize = Form.useWatch(packetSizePath, { form, preserve: true });
   const mode = typeof packetSize === 'string' && packetSize.trim() !== '' ? 'gecko' : 'salamander';
@@ -1178,6 +1320,7 @@ function SalamanderUdpMaskSettings({
   return (
     <>
       <Form.Item
+        htmlFor={`${uid}-salamander-mode`}
         label="Mode"
         extra={
           mode === 'gecko'
@@ -1185,7 +1328,8 @@ function SalamanderUdpMaskSettings({
             : 'Scrambles each packet into random-looking bytes.'
         }
       >
-        <Select
+        <NativeSelect
+          id={`${uid}-salamander-mode`}
           value={mode}
           onChange={(next) => {
             if (next === 'gecko') {
@@ -1217,10 +1361,14 @@ function SalamanderUdpMaskSettings({
             noStyle
             rules={[{ validator: validateSalamanderPassword }]}
           >
-            <Input placeholder="Obfuscation password" style={{ width: 'calc(100% - 32px)' }} />
+            <Input
+              aria-label="Password"
+              placeholder="Obfuscation password"
+              style={{ width: 'calc(100% - 32px)' }}
+            />
           </Form.Item>
           <Button
-            icon={<ReloadOutlined />}
+            icon={<ReloadOutlined aria-hidden />}
             aria-label={t('regenerate')}
             onClick={() =>
               form.setFieldValue(
@@ -1247,9 +1395,11 @@ function SalamanderUdpMaskSettings({
 }
 
 function GeckoPacketSizeInput({
+  id,
   value,
   onChange,
 }: {
+  id?: string;
   value?: string;
   onChange?: (value: string) => void;
 }) {
@@ -1258,6 +1408,7 @@ function GeckoPacketSizeInput({
   return (
     <Space.Compact block>
       <InputNumber
+        id={id}
         prefix="Min"
         min={GECKO_MIN_PACKET_SIZE}
         max={GECKO_MAX_PACKET_SIZE}
@@ -1268,6 +1419,7 @@ function GeckoPacketSizeInput({
         style={{ width: '50%' }}
       />
       <InputNumber
+        aria-label="Packet size max"
         prefix="Max"
         min={GECKO_MIN_PACKET_SIZE}
         max={GECKO_MAX_PACKET_SIZE}
@@ -1291,14 +1443,12 @@ function UdpHeaderCustom({
   absoluteSettingsPath: (string | number)[];
 }) {
   const { t } = useTranslation();
+  const uid = useId();
   return (
     <>
-      <Form.Item
-        label="Mode"
-        name={[udpFieldName, 'settings', 'mode']}
-        tooltip="Prefix puts the header on every packet; Standalone exchanges it as separate handshake packets first"
-      >
+      <Form.Item label="Mode" name={[udpFieldName, 'settings', 'mode']} tooltip={UDP_MODE_HINT}>
         <Select
+          aria-describedby={`${uid}-mode-hint`}
           allowClear
           placeholder="Prefix"
           options={[
@@ -1307,6 +1457,9 @@ function UdpHeaderCustom({
           ]}
         />
       </Form.Item>
+      <span id={`${uid}-mode-hint`} hidden>
+        {UDP_MODE_HINT}
+      </span>
       {(['client', 'server'] as const).map((groupKey) => (
         <Form.List key={groupKey} name={[udpFieldName, 'settings', groupKey]}>
           {(items, { add, remove }) => (
@@ -1315,7 +1468,7 @@ function UdpHeaderCustom({
                 <Button
                   type="primary"
                   size="small"
-                  icon={<PlusOutlined />}
+                  icon={<PlusOutlined aria-hidden />}
                   aria-label={t('add')}
                   onClick={() => add(defaultUdpClientServerItem())}
                 />
@@ -1361,6 +1514,7 @@ const XDNS_RECORD_TYPE_OPTIONS = [
 // Resolvers and extraPoll are read by clients only; a server keeps them for the share link.
 function XdnsSettings({ udpFieldName }: { udpFieldName: number }) {
   const { t } = useTranslation();
+  const uid = useId();
   return (
     <>
       <Form.List name={[udpFieldName, 'settings', 'domains']}>
@@ -1370,7 +1524,7 @@ function XdnsSettings({ udpFieldName }: { udpFieldName: number }) {
               <Button
                 type="primary"
                 size="small"
-                icon={<PlusOutlined />}
+                icon={<PlusOutlined aria-hidden />}
                 aria-label={t('add')}
                 onClick={() => add({ names: [], edns0: XDNS_LEGACY_EDNS0 })}
               />
@@ -1391,6 +1545,7 @@ function XdnsSettings({ udpFieldName }: { udpFieldName: number }) {
                 <Form.Item label="Names" name={[domain.name, 'names']}>
                   <Select
                     mode="tags"
+                    tagRender={selectTagRender}
                     style={{ width: '100%' }}
                     tokenSeparators={[',']}
                     placeholder="t.example.com"
@@ -1399,6 +1554,7 @@ function XdnsSettings({ udpFieldName }: { udpFieldName: number }) {
                 <Form.Item label="Record Types" name={[domain.name, 'types']}>
                   <Select
                     mode="multiple"
+                    tagRender={selectTagRender}
                     options={XDNS_RECORD_TYPE_OPTIONS}
                     placeholder="TXT (client), all (server)"
                   />
@@ -1424,29 +1580,63 @@ function XdnsSettings({ udpFieldName }: { udpFieldName: number }) {
               <Button
                 type="primary"
                 size="small"
-                icon={<PlusOutlined />}
+                icon={<PlusOutlined aria-hidden />}
                 aria-label={t('add')}
                 onClick={() => add({ addrs: [] })}
               />
             </Form.Item>
             {resolvers.map((resolver, ri) => (
-              <Form.Item key={resolver.key} label={`Resolver ${ri + 1}`}>
-                <Space.Compact block>
-                  <Form.Item name={[resolver.name, 'addrs']} noStyle>
-                    <Select
-                      mode="tags"
-                      style={{ width: '100%' }}
-                      tokenSeparators={[',', ' ']}
-                      placeholder="udp://8.8.8.8:53, tcp://1.1.1.1"
-                    />
-                  </Form.Item>
-                  <Button
-                    icon={<DeleteOutlined />}
+              <div key={resolver.key}>
+                <Divider style={{ margin: 0 }}>
+                  Resolver {ri + 1}
+                  <DeleteOutlined
+                    className="danger-icon"
+                    role="button"
+                    tabIndex={0}
                     aria-label={t('remove')}
                     onClick={() => remove(resolver.name)}
+                    onKeyDown={activateOnKey(() => remove(resolver.name))}
                   />
-                </Space.Compact>
-              </Form.Item>
+                </Divider>
+                <Form.Item label="Addresses" name={[resolver.name, 'addrs']}>
+                  <Select
+                    mode="tags"
+                    tagRender={selectTagRender}
+                    style={{ width: '100%' }}
+                    tokenSeparators={[',', ' ']}
+                    placeholder="udp://8.8.8.8:53, https://dns.google/dns-query"
+                  />
+                </Form.Item>
+                <Form.Item label="Workers" name={[resolver.name, 'worker']}>
+                  <InputNumber min={1} placeholder="32" />
+                </Form.Item>
+                <Form.Item
+                  label="DoH TLS"
+                  name={[resolver.name, 'tlsConfig']}
+                  tooltip={DOH_TLS_HINT}
+                >
+                  <JsonObjectInput
+                    aria-describedby={`${uid}-doh-tls-hint-${ri}`}
+                    placeholder='{"serverName": "dns.google", "fingerprint": "chrome"}'
+                  />
+                </Form.Item>
+                <span id={`${uid}-doh-tls-hint-${ri}`} hidden>
+                  {DOH_TLS_HINT}
+                </span>
+                <Form.Item
+                  label="DoH QUIC"
+                  name={[resolver.name, 'quicConfig']}
+                  tooltip={DOH_QUIC_HINT}
+                >
+                  <JsonObjectInput
+                    aria-describedby={`${uid}-doh-quic-hint-${ri}`}
+                    placeholder='{"congestion": "bbr"}'
+                  />
+                </Form.Item>
+                <span id={`${uid}-doh-quic-hint-${ri}`} hidden>
+                  {DOH_QUIC_HINT}
+                </span>
+              </div>
             ))}
           </>
         )}
@@ -1499,7 +1689,7 @@ function UdpHopSettings({ udpFieldName }: { udpFieldName: number }) {
         normalize={(value: string[]) => value.join(',')}
         rules={[{ required: true, message: 'pick at least one mode' }]}
       >
-        <Select mode="multiple" options={UDP_HOP_MODES} />
+        <Select mode="multiple" tagRender={selectTagRender} options={UDP_HOP_MODES} />
       </Form.Item>
       <Form.Item
         label="Interval (s)"
@@ -1512,7 +1702,12 @@ function UdpHopSettings({ udpFieldName }: { udpFieldName: number }) {
         <Input placeholder="20000-50000" />
       </Form.Item>
       <Form.Item label="Remote IPs" name={[udpFieldName, 'settings', 'remoteIPs']}>
-        <Select mode="tags" style={{ width: '100%' }} tokenSeparators={[',', ' ']} />
+        <Select
+          mode="tags"
+          tagRender={selectTagRender}
+          style={{ width: '100%' }}
+          tokenSeparators={[',', ' ']}
+        />
       </Form.Item>
     </>
   );
@@ -1531,7 +1726,54 @@ function validateNoiseReset(_: unknown, value: unknown) {
   return valid ? Promise.resolve() : Promise.reject(new Error('seconds, e.g. 0 or 60-120'));
 }
 
+// xray-core 26.10.17 (#7124) refuses a noise script beside noise items, so a script replaces the list.
 function NoiseItems({
+  udpFieldName,
+  form,
+  absoluteSettingsPath,
+}: {
+  udpFieldName: number;
+  form: FormInstance;
+  absoluteSettingsPath: (string | number)[];
+}) {
+  const uid = useId();
+  const script = Form.useWatch([...absoluteSettingsPath, 'script'], form) as string | undefined;
+  return (
+    <>
+      <Form.Item
+        label="Reset"
+        name={[udpFieldName, 'settings', 'reset']}
+        tooltip={NOISE_RESET_HINT}
+        rules={[{ validator: validateNoiseReset }]}
+      >
+        <Input placeholder="0 or 60-120" aria-describedby={`${uid}-reset-hint`} />
+      </Form.Item>
+      <span id={`${uid}-reset-hint`} hidden>
+        {NOISE_RESET_HINT}
+      </span>
+      <Form.Item
+        label="Script"
+        name={[udpFieldName, 'settings', 'script']}
+        tooltip={NOISE_SCRIPT_HINT}
+        normalize={(value: string) => value || undefined}
+      >
+        <Input allowClear placeholder="noise.lua" aria-describedby={`${uid}-script-hint`} />
+      </Form.Item>
+      <span id={`${uid}-script-hint`} hidden>
+        {NOISE_SCRIPT_HINT}
+      </span>
+      {!script && (
+        <NoiseItemList
+          udpFieldName={udpFieldName}
+          form={form}
+          absoluteSettingsPath={absoluteSettingsPath}
+        />
+      )}
+    </>
+  );
+}
+
+function NoiseItemList({
   udpFieldName,
   form,
   absoluteSettingsPath,
@@ -1543,14 +1785,6 @@ function NoiseItems({
   const { t } = useTranslation();
   return (
     <>
-      <Form.Item
-        label="Reset"
-        name={[udpFieldName, 'settings', 'reset']}
-        tooltip="Seconds before the noise is sent to a destination again; 0 sends it once"
-        rules={[{ validator: validateNoiseReset }]}
-      >
-        <Input placeholder="0 or 60-120" />
-      </Form.Item>
       <Form.List name={[udpFieldName, 'settings', 'noise']}>
         {(items, { add, remove }) => (
           <>
@@ -1558,7 +1792,7 @@ function NoiseItems({
               <Button
                 type="primary"
                 size="small"
-                icon={<PlusOutlined />}
+                icon={<PlusOutlined aria-hidden />}
                 aria-label={t('add')}
                 onClick={() => add(defaultNoiseItem())}
               />
@@ -1617,21 +1851,29 @@ function validateCustomVarName(_: unknown, value: unknown) {
 }
 
 // Hands the form only a parsed JSON object, so half-typed text never reaches the config.
-function TransformEditor({
+function JsonObjectInput({
+  id,
+  'aria-describedby': ariaDescribedBy,
   value,
   onChange,
+  placeholder,
 }: {
+  id?: string;
+  'aria-describedby'?: string;
   value?: Record<string, unknown>;
   onChange?: (next: Record<string, unknown> | undefined) => void;
+  placeholder?: string;
 }) {
   const [text, setText] = useState(() => (value ? JSON.stringify(value) : ''));
   const [invalid, setInvalid] = useState(false);
   return (
     <>
       <Input.TextArea
+        id={id}
+        aria-describedby={ariaDescribedBy}
         value={text}
         autoSize={{ minRows: 2, maxRows: 8 }}
-        placeholder='{"op": "concat", "args": [{"reuse": "nonce"}]}'
+        placeholder={placeholder}
         onChange={(e) => {
           const next = e.target.value;
           setText(next);
@@ -1671,6 +1913,7 @@ function ItemEditor({
   onRemove?: () => void;
 }) {
   const { t } = useTranslation();
+  const uid = useId();
   const [kind, setKind] = useState<ItemKind>(() =>
     allowVariables ? itemKindOf(form.getFieldValue(absoluteItemPath)) : 'bytes',
   );
@@ -1704,13 +1947,18 @@ function ItemEditor({
   return (
     <>
       {allowVariables && (
-        <Form.Item label="Kind">
-          <Select value={kind} onChange={onKindChange} options={ITEM_KIND_OPTIONS} />
+        <Form.Item label="Kind" htmlFor={`${uid}-kind`}>
+          <NativeSelect
+            id={`${uid}-kind`}
+            value={kind}
+            onChange={onKindChange}
+            options={ITEM_KIND_OPTIONS}
+          />
         </Form.Item>
       )}
       {kind === 'bytes' && (
         <Form.Item label="Type" name={[fieldName, 'type']}>
-          <Select
+          <NativeSelect
             onChange={onTypeChange}
             options={[
               { value: 'array', label: 'Array' },
@@ -1736,27 +1984,40 @@ function ItemEditor({
       )}
 
       {kind === 'reuse' && (
-        <Form.Item
-          label="Reuse"
-          name={[fieldName, 'reuse']}
-          tooltip="Writes the bytes an earlier item captured under this name"
-          rules={[
-            { required: true, message: 'name the captured variable' },
-            { validator: validateCustomVarName },
-          ]}
-        >
-          <Input placeholder="variable name" />
-        </Form.Item>
+        <>
+          <Form.Item
+            label="Reuse"
+            name={[fieldName, 'reuse']}
+            tooltip={REUSE_HINT}
+            rules={[
+              { required: true, message: 'name the captured variable' },
+              { validator: validateCustomVarName },
+            ]}
+          >
+            <Input placeholder="variable name" aria-describedby={`${uid}-reuse-hint`} />
+          </Form.Item>
+          <span id={`${uid}-reuse-hint`} hidden>
+            {REUSE_HINT}
+          </span>
+        </>
       )}
       {kind === 'transform' && (
-        <Form.Item
-          label="Transform"
-          name={[fieldName, 'transform']}
-          tooltip='An expression tree, e.g. {"op": "concat", "args": [{"type": "str", "bytes": "OK "}, {"reuse": "nonce"}]}'
-          rules={[{ required: true, message: 'enter the transform expression' }]}
-        >
-          <TransformEditor />
-        </Form.Item>
+        <>
+          <Form.Item
+            label="Transform"
+            name={[fieldName, 'transform']}
+            tooltip={TRANSFORM_HINT}
+            rules={[{ required: true, message: 'enter the transform expression' }]}
+          >
+            <JsonObjectInput
+              aria-describedby={`${uid}-transform-hint`}
+              placeholder='{"op": "concat", "args": [{"reuse": "nonce"}]}'
+            />
+          </Form.Item>
+          <span id={`${uid}-transform-hint`} hidden>
+            {TRANSFORM_HINT}
+          </span>
+        </>
       )}
 
       <Form.Item
@@ -1798,10 +2059,14 @@ function ItemEditor({
               <Form.Item label="Packet">
                 <Space.Compact block>
                   <Form.Item name={[fieldName, 'packet']} noStyle>
-                    <Input placeholder="binary data" style={{ width: 'calc(100% - 32px)' }} />
+                    <Input
+                      aria-label="Packet"
+                      placeholder="binary data"
+                      style={{ width: 'calc(100% - 32px)' }}
+                    />
                   </Form.Item>
                   <Button
-                    icon={<ReloadOutlined />}
+                    icon={<ReloadOutlined aria-hidden />}
                     aria-label={t('regenerate')}
                     onClick={() =>
                       form.setFieldValue([...absoluteItemPath, 'packet'], RandomUtil.randomBase64())
@@ -1820,15 +2085,20 @@ function ItemEditor({
       </Form.Item>
 
       {allowVariables && (
-        <Form.Item
-          label="Capture"
-          name={[fieldName, 'capture']}
-          tooltip="Saves the bytes this item writes or reads under a name later items can reuse"
-          normalize={(v) => (v === '' ? undefined : v)}
-          rules={[{ validator: validateCustomVarName }]}
-        >
-          <Input placeholder="variable name" />
-        </Form.Item>
+        <>
+          <Form.Item
+            label="Capture"
+            name={[fieldName, 'capture']}
+            tooltip={CAPTURE_HINT}
+            normalize={(v) => (v === '' ? undefined : v)}
+            rules={[{ validator: validateCustomVarName }]}
+          >
+            <Input placeholder="variable name" aria-describedby={`${uid}-capture-hint`} />
+          </Form.Item>
+          <span id={`${uid}-capture-hint`} hidden>
+            {CAPTURE_HINT}
+          </span>
+        </>
       )}
     </>
   );
@@ -1843,6 +2113,7 @@ function QuicParamsForm({
   form: FormInstance;
   showUdpHop: boolean;
 }) {
+  const uid = useId();
   const congestion = Form.useWatch([...base, 'congestion'], form) as string | undefined;
   const udpHop = Form.useWatch([...base, 'udpHop'], { form, preserve: true }) as
     | Record<string, unknown>
@@ -1852,7 +2123,7 @@ function QuicParamsForm({
   return (
     <>
       <Form.Item label="Congestion" name={[...base, 'congestion']}>
-        <Select
+        <NativeSelect
           options={[
             { value: 'reno', label: 'Reno' },
             { value: 'bbr', label: 'BBR' },
@@ -1900,16 +2171,18 @@ function QuicParamsForm({
           itself listens on its own port. */}
       {showUdpHop && (
         <>
-          <Form.Item
-            label="UDP Hop"
-            tooltip="Advertised to clients as a hop range; the server listens on its own port only"
-          >
+          <Form.Item htmlFor={`${uid}-udp-hop`} label="UDP Hop" tooltip={UDP_HOP_HINT}>
             <Switch
+              id={`${uid}-udp-hop`}
+              aria-describedby={`${uid}-udp-hop-hint`}
               checked={hasUdpHop}
               onChange={(v) => {
                 form.setFieldValue([...base, 'udpHop'], v ? defaultUdpHop() : undefined);
               }}
             />
+            <span id={`${uid}-udp-hop-hint`} hidden>
+              {UDP_HOP_HINT}
+            </span>
           </Form.Item>
           {hasUdpHop && (
             <>

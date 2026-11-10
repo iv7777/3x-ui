@@ -19,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
+	"github.com/mhsanaei/3x-ui/v3/internal/xray"
 )
 
 // Server is an in-process native Go TUIC v5 server terminating QUIC
@@ -32,14 +33,17 @@ type Server struct {
 	logLevel          atomic.Uint32
 
 	maxUdpRelayPacketSize int
+	pendingUdpBudget      pendingUdpBudget
 
 	users *UserRegistry
 	relay *SocksRelay
 
-	tlsConfig    *tls.Config
-	quicConfig   *quic.Config
-	quicListener *quic.Listener
-	packetConn   net.PacketConn
+	tlsConfig     *tls.Config
+	quicConfig    *quic.Config
+	quicListener  *quic.Listener
+	quicTransport *quic.Transport
+	pending       pendingConns
+	packetConn    net.PacketConn
 
 	lastOnline  sync.Map // email string -> time.Time
 	logThrottle sync.Map // event name -> *atomic.Int64 timestamp
@@ -88,6 +92,11 @@ func NewServer(inst Instance, relay *SocksRelay) (*Server, error) {
 	authTimeout := inst.AuthenticationTimeout
 	if authTimeout <= 0 {
 		authTimeout = 3
+	}
+	// A second count past a day only wraps the Duration below; rows stored before the save
+	// path bounded it fail here instead of panicking the listener on its first handshake.
+	if maxIdle > MaxTimeoutSeconds || authTimeout > MaxTimeoutSeconds {
+		return nil, fmt.Errorf("tuic: max_idle_time and authentication_timeout must not exceed %d seconds", MaxTimeoutSeconds)
 	}
 	maxUdpSize := inst.MaxUdpRelayPacketSize
 	if maxUdpSize <= 0 {
@@ -139,12 +148,21 @@ func (s *Server) Start() error {
 	}
 	s.packetConn = pConn
 
-	ln, err := quic.Listen(pConn, s.tlsConfig, s.quicConfig)
+	transport := &quic.Transport{
+		Conn:                pConn,
+		VerifySourceAddress: s.pending.needsRetry,
+		ConnContext: func(ctx context.Context, info *quic.ClientInfo) (context.Context, error) {
+			return s.pending.admit(ctx, connInfo{remote: info.RemoteAddr, addressVerified: info.AddrVerified})
+		},
+	}
+	ln, err := transport.Listen(s.tlsConfig, s.quicConfig)
 	if err != nil {
+		_ = transport.Close()
 		_ = pConn.Close()
 		return fmt.Errorf("tuic: quic listen on %s: %w", s.listenAddr, err)
 	}
 	s.quicListener = ln
+	s.quicTransport = transport
 	s.running.Store(true)
 	s.logf(tuicLogInfo, "listener started on %s", s.listenAddr)
 
@@ -189,14 +207,18 @@ func (s *Server) applyCongestionControl(conn *quic.Conn) {
 	}
 }
 
-func (s *Server) registerConn(user *User, conn *quic.Conn) {
+func (s *Server) registerConn(user *User, conn *quic.Conn) bool {
 	s.activeConnsMu.Lock()
 	defer s.activeConnsMu.Unlock()
+	if user.sessions.Load() >= maxUserSessions {
+		return false
+	}
 	if s.activeConns[user.UUID] == nil {
 		s.activeConns[user.UUID] = make(map[*quic.Conn]*User)
 	}
 	s.activeConns[user.UUID][conn] = user
 	user.sessions.Add(1)
+	return true
 }
 
 func (s *Server) unregisterConn(user *User, conn *quic.Conn) {
@@ -355,6 +377,7 @@ func (s *Server) handleConn(conn *quic.Conn) {
 		authOnce        sync.Once
 		udpAssociations = newUdpAssociationRegistry(s.maxUdpRelayPacketSize)
 	)
+	udpAssociations.pendingBudget = &s.pendingUdpBudget
 
 	authTimer := time.AfterFunc(s.authTimeout, func() {
 		if authState.CompareAndSwap(0, 2) {
@@ -371,10 +394,15 @@ func (s *Server) handleConn(conn *quic.Conn) {
 			if !authState.CompareAndSwap(0, 1) {
 				return authState.Load() == 1 && authUser.Load() == user
 			}
+			if !s.registerConn(user, conn) {
+				authState.Store(2)
+				s.logLimited(tuicLogWarn, "tuic-sessions", 30*time.Second, "client refused: more than %d connections", maxUserSessions)
+				return false
+			}
 			authUser.Store(user)
-			s.registerConn(user, conn)
 			s.markActive(user.Email)
 			authTimer.Stop()
+			releasePendingSlot(conn.Context())
 			s.logf(tuicLogInfo, "client authenticated")
 			authOnce.Do(func() { close(authSignal) })
 			return true
@@ -414,6 +442,19 @@ func (s *Server) handleConn(conn *quic.Conn) {
 	defer cleanup()
 
 	var innerWg sync.WaitGroup
+	// Before authentication each stream kind may start only a few handlers; a peer that never
+	// authenticates would otherwise get a goroutine per stream it opens.
+	var preAuthUni, preAuthBi atomic.Int32
+	preAuthSlot := func(count *atomic.Int32) (release func(), ok bool) {
+		if authState.Load() == 1 {
+			return func() {}, true
+		}
+		if count.Add(1) > maxPreAuthStreams {
+			count.Add(-1)
+			return nil, false
+		}
+		return func() { count.Add(-1) }, true
+	}
 	// Loop 1: Unidirectional streams
 	innerWg.Add(1)
 	go func() {
@@ -423,9 +464,15 @@ func (s *Server) handleConn(conn *quic.Conn) {
 			if err != nil {
 				return
 			}
+			release, ok := preAuthSlot(&preAuthUni)
+			if !ok {
+				uniStream.CancelRead(0x100)
+				continue
+			}
 			innerWg.Add(1)
 			go func(stream *quic.ReceiveStream) {
 				defer innerWg.Done()
+				defer release()
 				s.handleUniStream(sessCtx, conn, stream, authenticate, waitForAuth, udpAssociations, &relayWg)
 			}(uniStream)
 		}
@@ -440,9 +487,16 @@ func (s *Server) handleConn(conn *quic.Conn) {
 			if err != nil {
 				return
 			}
+			release, ok := preAuthSlot(&preAuthBi)
+			if !ok {
+				biStream.CancelRead(0x100)
+				biStream.CancelWrite(0x100)
+				continue
+			}
 			innerWg.Add(1)
 			go func(stream *quic.Stream) {
 				defer innerWg.Done()
+				defer release()
 				s.handleBiStream(sessCtx, conn, stream, authenticate, waitForAuth)
 			}(biStream)
 		}
@@ -632,6 +686,9 @@ type packetReassembler struct {
 	maxPacketSize int
 	packets       map[packetFragmentKey]*packetReassembly
 }
+
+// MaxTimeoutSeconds bounds the second-count settings, far above any useful timeout.
+const MaxTimeoutSeconds = 86400
 
 const (
 	maxSafeUdpRelayPacketSize   = maxSocksUdpDatagramSize - 262
@@ -835,15 +892,35 @@ func (s *Server) forwardUDPPacket(
 	udpAssociations *udpAssociationRegistry,
 	relayWg *sync.WaitGroup,
 ) {
-	if len(payload) > s.maxUdpRelayPacketSize || !isPacketTarget(target) {
-		return
-	}
 	if association == nil || len(payload) > s.maxUdpRelayPacketSize || !isPacketTarget(target) {
 		return
 	}
-	association, created, err := udpAssociations.ensureRelay(ctx, assocID, association, user, s.relay)
+	sess, opening, err := udpAssociations.queuePacket(ctx, assocID, association, target, payload)
 	if err != nil {
-		s.logLimited(tuicLogWarn, "udp-dial", 30*time.Second, "UDP relay could not be opened: %v", err)
+		s.logLimited(tuicLogWarn, "udp-queue", 30*time.Second, "UDP relay packet could not be queued: %v", err)
+		return
+	}
+	if sess != nil {
+		s.sendUDPRequest(user, sess, target, payload)
+		return
+	}
+	if opening == nil {
+		return
+	}
+	relayWg.Add(1)
+	go func() {
+		defer relayWg.Done()
+		s.openUDPRelay(ctx, opening, conn, user, assocID, association, udpAssociations, relayWg)
+	}()
+}
+
+func (s *Server) openUDPRelay(ctx, opening context.Context, conn *quic.Conn, user *User, assocID uint16, association *udpAssociation, udpAssociations *udpAssociationRegistry, relayWg *sync.WaitGroup) {
+	_, created, err := udpAssociations.ensureRelay(opening, assocID, association, user, s.relay)
+	if err != nil {
+		if opening.Err() == nil {
+			s.logLimited(tuicLogWarn, "udp-dial", 30*time.Second, "UDP relay could not be opened: %v", err)
+		}
+		udpAssociations.failPending(association)
 		return
 	}
 	sess := association.relay
@@ -855,7 +932,19 @@ func (s *Server) forwardUDPPacket(
 			s.relayUDPResponses(ctx, conn, user, assocID, association, udpAssociations, sess)
 		}()
 	}
+	for {
+		packet, ok := udpAssociations.nextPending(assocID, association)
+		if !ok {
+			return
+		}
+		if ctx.Err() == nil {
+			s.sendUDPRequest(user, sess, packet.target, packet.payload)
+		}
+		udpAssociations.releasePendingPacket(packet)
+	}
+}
 
+func (s *Server) sendUDPRequest(user *User, sess *udpRelaySession, target *Address, payload []byte) {
 	if _, err := sess.relay.Send(target, payload); err != nil {
 		s.logLimited(tuicLogWarn, "udp-send", 30*time.Second, "UDP relay request failed: %v", err)
 		return
@@ -879,6 +968,11 @@ func (s *Server) relayUDPResponses(
 	sess *udpRelaySession,
 ) {
 	defer associations.release(assocID, association)
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	if !associations.attachResponseStop(assocID, association, stop) {
+		return
+	}
 	buf := make([]byte, s.maxUdpRelayPacketSize+263)
 	var nextPktID uint16
 	for {
@@ -976,6 +1070,9 @@ func (s *Server) Close() error {
 	if s.quicListener != nil {
 		err = s.quicListener.Close()
 	}
+	if s.quicTransport != nil {
+		_ = s.quicTransport.Close()
+	}
 	if s.packetConn != nil {
 		_ = s.packetConn.Close()
 	}
@@ -1054,6 +1151,12 @@ func (s *Server) logLimited(level uint32, key string, interval time.Duration, fo
 func loadCertificate(certInput, keyInput string) (tls.Certificate, error) {
 	if strings.Contains(certInput, "-----BEGIN CERTIFICATE-----") {
 		return tls.X509KeyPair([]byte(certInput), []byte(keyInput))
+	}
+	// A pushed inbound names these paths, and both are read whole.
+	for _, path := range []string{certInput, keyInput} {
+		if err := xray.CheckCertFile(path); err != nil {
+			return tls.Certificate{}, err
+		}
 	}
 	return tls.LoadX509KeyPair(certInput, keyInput)
 }

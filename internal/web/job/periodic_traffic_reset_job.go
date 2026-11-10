@@ -87,22 +87,32 @@ func (j *PeriodicTrafficResetJob) resetInboundsOnSchedule() {
 	logger.Infof("Running periodic traffic reset job for period: %s (%d matching inbounds)", j.period, len(inbounds))
 
 	var resetCount atomic.Int32
+	var needRestart atomic.Bool
 	forEachResetBounded(len(inbounds), func(i int) {
 		inbound := inbounds[i]
-		resetInboundErr := j.inboundService.ResetInboundTraffic(inbound.Id)
+		nr, resetInboundErr := j.inboundService.ResetInboundTraffic(inbound.Id)
 		if resetInboundErr != nil {
 			logger.Warning("Failed to reset traffic for inbound", inbound.Id, ":", resetInboundErr)
+		} else if nr {
+			needRestart.Store(true)
 		}
 
-		resetClientErr := j.clientService.ResetAllClientTraffics(&j.inboundService, inbound.Id)
+		nr, resetClientErr := j.clientService.ResetAllClientTraffics(&j.inboundService, inbound.Id)
 		if resetClientErr != nil {
 			logger.Warning("Failed to reset traffic for all users of inbound", inbound.Id, ":", resetClientErr)
+		}
+		if nr {
+			needRestart.Store(true)
 		}
 
 		if resetInboundErr == nil && resetClientErr == nil {
 			resetCount.Add(1)
 		}
 	})
+
+	if needRestart.Load() {
+		j.xrayService.SetToNeedRestart()
+	}
 
 	if count := resetCount.Load(); count > 0 {
 		logger.Infof("Periodic traffic reset completed: %d inbounds reset", count)

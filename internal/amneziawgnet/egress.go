@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -22,6 +24,15 @@ import (
 // EgressBasePort is the loopback port the panel's SOCKS5 egress server tries
 // first; generated amneziawg socks bridges dial whichever port it holds.
 const EgressBasePort = 64900
+
+// reservedLoopbackFloor is where the panel's own loopback listeners start (Xray API 62789, node
+// egress, TUIC and AmneziaWG relays); a fallback egress port must stay below it.
+const reservedLoopbackFloor = 62789
+
+// listenTCP opens a loopback listener; a test stands in for the OS through it.
+var listenTCP = func(ctx context.Context, addr string) (net.Listener, error) {
+	return (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
+}
 
 // socks5EgressServer is a minimal loopback SOCKS5 server routing Xray's
 // bridged amneziawg outbounds into their embedded devices' netstacks.
@@ -114,11 +125,10 @@ func (s *socks5EgressServer) Listen() error {
 	if s.listener != nil {
 		return nil
 	}
-	lc := &net.ListenConfig{}
-	ln, err := lc.Listen(context.Background(), "tcp", fmt.Sprintf("127.0.0.1:%d", EgressBasePort))
+	ln, err := listenTCP(context.Background(), fmt.Sprintf("127.0.0.1:%d", EgressBasePort))
 	if err != nil {
 		var fallbackErr error
-		if ln, fallbackErr = lc.Listen(context.Background(), "tcp", "127.0.0.1:0"); fallbackErr != nil {
+		if ln, fallbackErr = listenBelowReserved(context.Background()); fallbackErr != nil {
 			return fmt.Errorf("amneziawgnet: egress listen: %w", errors.Join(err, fallbackErr))
 		}
 		logger.Warningf("amneziawgnet: egress port %d unavailable, using a free port: %v", EgressBasePort, err)
@@ -129,6 +139,24 @@ func (s *socks5EgressServer) Listen() error {
 	s.wg.Add(1)
 	go s.acceptLoop(ln, s.closing)
 	return nil
+}
+
+// fallbackPortFloor keeps the fallback clear of the well-known and registered low ports.
+const fallbackPortFloor = 40000
+
+// listenBelowReserved binds a random loopback port under reservedLoopbackFloor, retrying taken or
+// OS-reserved ones; an OS-chosen port could land inside the panel's own ranges.
+func listenBelowReserved(ctx context.Context) (net.Listener, error) {
+	var errs []error
+	for range 64 {
+		port := fallbackPortFloor + mrand.IntN(reservedLoopbackFloor-fallbackPortFloor)
+		ln, err := listenTCP(ctx, fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			return ln, nil
+		}
+		errs = append(errs, err)
+	}
+	return nil, errors.Join(errs...)
 }
 
 // Port is the port generated socks bridges must dial: the bound one, or
@@ -191,6 +219,9 @@ func (s *socks5EgressServer) acceptLoop(ln net.Listener, closing chan struct{}) 
 			default:
 			}
 			logger.Warningf("amneziawgnet: egress accept: %v", err)
+			if !waitAcceptRetry(closing) {
+				return
+			}
 			continue
 		}
 		select {
@@ -452,7 +483,55 @@ type udpControl struct{ conn net.Conn }
 type egressUDPSession struct {
 	dst  netip.AddrPort
 	conn *gonet.UDPConn
+
+	// Unix nanoseconds of the last datagram either way; the budget evicts by it.
+	lastActive atomic.Int64
 }
+
+func (s *egressUDPSession) touch() { s.lastActive.Store(time.Now().UnixNano()) }
+
+// egressMaxUDPSessions bounds the sessions of all associations together: each
+// pins a goroutine, a port and 64 KiB, and a Mux frame opens an association.
+var egressMaxUDPSessions = 4096
+
+// egressUDPBudget is process-wide, like the egress server: the socks bridge
+// carries no user identity, so every user draws on the same budget.
+type egressUDPBudget struct {
+	mu   sync.Mutex
+	live map[*egressUDPSession]struct{}
+}
+
+var egressUDPSessions = egressUDPBudget{live: map[*egressUDPSession]struct{}{}}
+
+// admit counts sess in. A spent budget closes the longest-idle session rather
+// than refusing sess, so a flood's unanswered flows go before live ones.
+func (b *egressUDPBudget) admit(sess *egressUDPSession) {
+	var idlest *egressUDPSession
+	b.mu.Lock()
+	if len(b.live) >= egressMaxUDPSessions {
+		for s := range b.live {
+			if idlest == nil || s.lastActive.Load() < idlest.lastActive.Load() {
+				idlest = s
+			}
+		}
+		delete(b.live, idlest)
+	}
+	b.live[sess] = struct{}{}
+	b.mu.Unlock()
+	if idlest != nil {
+		idlest.conn.Close()
+	}
+}
+
+func (b *egressUDPBudget) release(sess *egressUDPSession) {
+	b.mu.Lock()
+	delete(b.live, sess)
+	b.mu.Unlock()
+}
+
+// maxPendingUDPResolves caps the domain datagrams one association may have
+// waiting on tunnel DNS; each holds a goroutine and a copy of the datagram.
+const maxPendingUDPResolves = 32
 
 // relayUDP answers the associate request and relays datagrams to
 // per-destination tunnel endpoints until the control connection closes.
@@ -476,6 +555,7 @@ func (s *socks5EgressServer) relayUDP(dev *Device, tag string, ctl udpControl, _
 	}
 
 	sessions := &udpEgressSessions{m: map[netip.AddrPort]*egressUDPSession{}}
+	pendingResolves := make(chan struct{}, maxPendingUDPResolves)
 
 	// Reader: strip per-datagram SOCKS5 headers and forward into the tunnel;
 	// only the associated client's address is accepted.
@@ -505,10 +585,20 @@ func (s *socks5EgressServer) relayUDP(dev *Device, tag string, ctl udpControl, _
 				if perr != nil {
 					continue
 				}
+				dnsSrv := s.currentDNSServer(tag)
+				if daddr, ok := cachedTunnelAddr(dev, tag, dnsSrv, name); ok {
+					s.deliverUDPDatagram(dev, tag, udpConn, client, sessions, netip.AddrPortFrom(daddr, port), data[hdrLen:])
+					continue
+				}
+				select {
+				case pendingResolves <- struct{}{}:
+				default:
+					continue // enough lookups pending; UDP may drop
+				}
 				// Resolve off reader loop so slow tunnel DNS lookups do not
 				// stall other destinations on this association.
 				go func(client netip.AddrPort, name string, port uint16, hdrLen int, datagram []byte) {
-					dnsSrv := s.currentDNSServer(tag)
+					defer func() { <-pendingResolves }()
 					rctx, rcancel := context.WithTimeout(context.Background(), tunnelResolveTimeout)
 					daddr, rerr := resolveTunnelVia(rctx, dev, tag, dnsSrv, name)
 					rcancel()
@@ -574,6 +664,8 @@ func (s *udpEgressSessions) getOrDial(dev *Device, tag string, udpConn *net.UDPC
 		return nil
 	}
 	sess := &egressUDPSession{dst: dst, conn: conn}
+	sess.touch() // before admit: a zero stamp is the next one evicted
+	egressUDPSessions.admit(sess)
 	s.m[dst] = sess
 	go pumpUDPEgress(udpConn, client, sess, s)
 	return sess
@@ -597,6 +689,7 @@ func (s *socks5EgressServer) deliverUDPDatagram(dev *Device, tag string, udpConn
 	if sess == nil {
 		return
 	}
+	sess.touch()
 	if _, werr := sess.conn.Write(payload); werr != nil {
 		logger.Warningf("amneziawgnet: egress %q: send udp to %s: %v", tag, dst, werr)
 	}
@@ -609,6 +702,7 @@ func pumpUDPEgress(udpConn *net.UDPConn, client netip.AddrPort, sess *egressUDPS
 		sessions.mu.Lock()
 		delete(sessions.m, sess.dst)
 		sessions.mu.Unlock()
+		egressUDPSessions.release(sess)
 		sess.conn.Close()
 	}()
 	buf := make([]byte, 65536)
@@ -619,6 +713,7 @@ func pumpUDPEgress(udpConn *net.UDPConn, client netip.AddrPort, sess *egressUDPS
 		if err != nil {
 			return
 		}
+		sess.touch()
 		hdr := make([]byte, 0, 3+1+16+2+n)
 		hdr = append(hdr, 0x00, 0x00, 0x00) // RSV RSV FRAG(=0)
 		if sess.dst.Addr().Is4() {

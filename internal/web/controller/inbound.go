@@ -6,7 +6,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgkern"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/json_util"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/wirecodec"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/middleware"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
@@ -64,10 +66,11 @@ func (a *InboundController) broadcastInboundsUpdate(userId int) {
 // node-sync push, so the node stores the row instead of re-judging it.
 func (a *InboundController) inboundServiceFor(c *gin.Context) *service.InboundService {
 	svc := a.inboundService
-	scope, _ := c.Get("api_token_scope")
+	scopeValue, _ := c.Get("api_token_scope")
+	scope, _ := scopeValue.(string)
 	// A master enrolled with an admin token (the -getApiToken default) has no
 	// node-sync scope, so it marks every request it sends instead.
-	svc.FromNodeSync = scope == model.ApiScopeNodeSync || c.GetHeader(wirecodec.MasterPushHeader) != ""
+	svc.FromNodeSync = model.IsNodeSyncApiScope(scope) || c.GetHeader(wirecodec.MasterPushHeader) != ""
 	return &svc
 }
 
@@ -79,6 +82,7 @@ func (a *InboundController) initRouter(g *gin.RouterGroup) {
 	g.GET("/allLinks", a.getAllInboundLinks)
 	g.GET("/get/:id", a.getInbound)
 	g.GET("/:id/fallbacks", a.getFallbacks)
+	g.GET("/amneziawgKernelReadiness", a.getAmneziaWGKernelReadiness)
 
 	g.POST("/add", a.addInbound)
 	g.POST("/del/:id", a.delInbound)
@@ -141,6 +145,12 @@ func (a *InboundController) getInboundOptions(c *gin.Context) {
 		return
 	}
 	jsonObj(c, options, nil)
+}
+
+// getAmneziaWGKernelReadiness reports whether this host can run an AmneziaWG
+// inbound on the kernel module, so the form can disable the toggle and say why.
+func (a *InboundController) getAmneziaWGKernelReadiness(c *gin.Context) {
+	jsonObj(c, amneziawgkern.HostReadiness(), nil)
 }
 
 // getInbound retrieves a specific inbound by its ID.
@@ -330,11 +340,12 @@ func (a *InboundController) resetInboundTraffic(c *gin.Context) {
 		return
 	}
 
-	err = a.inboundService.ResetInboundTraffic(id)
+	needRestart, err := a.inboundService.ResetInboundTraffic(id)
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
-	} else {
+	}
+	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetInboundTrafficSuccess"), nil)
@@ -376,28 +387,37 @@ func (a *InboundController) delAllInboundClients(c *gin.Context) {
 
 // resetAllTraffics resets all traffic counters across all inbounds.
 func (a *InboundController) resetAllTraffics(c *gin.Context) {
-	err := a.inboundService.ResetAllTraffics()
+	needRestart, err := a.inboundService.ResetAllTraffics()
 	if err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
-	} else {
+	}
+	if needRestart {
 		a.xrayService.SetToNeedRestart()
 	}
 	jsonMsg(c, I18nWeb(c, "pages.inbounds.toasts.resetAllTrafficSuccess"), nil)
 }
 
+// maxPushedClientTraffics bounds one push: each entry decodes into a whole traffic row.
+const maxPushedClientTraffics = 1 << 18
+
 // pushClientTraffics receives a master panel's aggregated per-client usage
 // (see InboundService.AcceptGlobalTraffic for the storage semantics).
 func (a *InboundController) pushClientTraffics(c *gin.Context) {
 	var req struct {
-		MasterGuid string                `json:"masterGuid"`
-		Traffics   []*xray.ClientTraffic `json:"traffics"`
+		MasterGuid string          `json:"masterGuid"`
+		Traffics   json.RawMessage `json:"traffics"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}
-	if err := a.inboundService.AcceptGlobalTraffic(req.MasterGuid, req.Traffics); err != nil {
+	traffics, err := json_util.DecodeCappedList[*xray.ClientTraffic](req.Traffics, maxPushedClientTraffics)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
+		return
+	}
+	if err := a.inboundService.AcceptGlobalTraffic(req.MasterGuid, traffics); err != nil {
 		jsonMsg(c, I18nWeb(c, "somethingWentWrong"), err)
 		return
 	}

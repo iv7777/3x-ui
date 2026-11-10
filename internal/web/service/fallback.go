@@ -3,6 +3,7 @@ package service
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"reflect"
 	"strconv"
@@ -59,17 +60,27 @@ func (s *FallbackService) GetParentForChild(childId int) (*model.InboundFallback
 	return &row, nil
 }
 
-// SetByMaster replaces the master's entire fallback list atomically. On a
-// node-hosted inbound it also queues the push that carries the list to the node.
+// SetByMaster replaces the master's entire fallback list atomically. On a node-hosted
+// inbound it also queues the push that carries the list to the node.
 func (s *FallbackService) SetByMaster(masterId int, items []FallbackInput) error {
-	return database.GetDB().Transaction(func(tx *gorm.DB) error {
+	return runSerializedTx(func(tx *gorm.DB) error {
+		var master model.Inbound
+		if err := tx.Where("id = ?", masterId).Limit(1).Find(&master).Error; err != nil {
+			return err
+		}
+		if len(items) > 0 {
+			if master.Id == 0 {
+				return gorm.ErrRecordNotFound
+			}
+			if !inboundCanHostFallbacks(&master) {
+				return fmt.Errorf("inbound %d cannot host fallbacks: use TCP with TLS/REALITY and disable VLESS decryption first", masterId)
+			}
+		}
 		if err := replaceFallbackRules(tx, masterId, items); err != nil {
 			return err
 		}
-		var master model.Inbound
-		err := tx.Select("id", "node_id", "settings").Where("id = ?", masterId).Limit(1).Find(&master).Error
-		if err != nil || master.Id == 0 {
-			return err
+		if master.Id == 0 {
+			return nil
 		}
 		// The table is the only truth from here on; a stale settings copy would
 		// resurrect a rule the operator just deleted.
@@ -172,7 +183,7 @@ func (s *FallbackService) WireByMasters(tx *gorm.DB, masterIds []int) (map[int]m
 		childIds = append(childIds, rows[i].ChildId)
 	}
 	var children []model.Inbound
-	if err := tx.Select("id", "listen", "port").Where("id IN ?", childIds).Find(&children).Error; err != nil {
+	if err := tx.Select("id", "listen", "port", "stream_settings").Where("id IN ?", childIds).Find(&children).Error; err != nil {
 		return nil, err
 	}
 	byId := make(map[int]*model.Inbound, len(children))
@@ -182,16 +193,22 @@ func (s *FallbackService) WireByMasters(tx *gorm.DB, masterIds []int) (map[int]m
 
 	for _, r := range rows {
 		dest := strings.TrimSpace(r.Dest)
+		xver := r.Xver
 		if dest == "" {
 			child, ok := byId[r.ChildId]
 			if !ok {
 				continue
 			}
 			dest = net.JoinHostPort(fallbackChildHost(child.Listen), strconv.Itoa(child.Port))
+			// A child that accepts PROXY protocol rejects a fallback without the header (#6835);
+			// deriving it here keeps the row right through either order of toggling.
+			if xver == 0 && acceptsProxyProtocol(child.StreamSettings) {
+				xver = 1
+			}
 		}
 		w := model.FallbackWire{Dest: dest, Name: r.Name, Alpn: r.Alpn, Path: r.Path}
-		if r.Xver > 0 {
-			w.Xver = r.Xver
+		if xver > 0 {
+			w.Xver = xver
 		}
 		out[r.MasterId] = append(out[r.MasterId], w)
 	}
@@ -221,10 +238,14 @@ func (s *FallbackService) ApplyWire(tx *gorm.DB, master *model.Inbound, set mode
 	items := make([]FallbackInput, 0, len(set))
 	for i, w := range set {
 		item := FallbackInput{Name: w.Name, Alpn: w.Alpn, Path: w.Path, Xver: w.Xver, SortOrder: i}
-		if childId, err := siblingInboundForDest(tx, master, w.Dest); err != nil {
+		if child, err := siblingInboundForDest(tx, master, w.Dest); err != nil {
 			return false, err
-		} else if childId > 0 {
-			item.ChildId = childId
+		} else if child != nil {
+			item.ChildId = child.Id
+			// The link derives this header itself; storing it would outlive the child's setting.
+			if w.Xver == 1 && acceptsProxyProtocol(child.StreamSettings) {
+				item.Xver = 0
+			}
 		} else {
 			item.Dest = w.Dest
 		}
@@ -237,17 +258,17 @@ func (s *FallbackService) ApplyWire(tx *gorm.DB, master *model.Inbound, set mode
 }
 
 // siblingInboundForDest finds the single inbound beside master (same node, or
-// both local) that listens where dest points; 0 when none or ambiguous.
-func siblingInboundForDest(tx *gorm.DB, master *model.Inbound, dest string) (int, error) {
+// both local) that listens where dest points; nil when none or ambiguous.
+func siblingInboundForDest(tx *gorm.DB, master *model.Inbound, dest string) (*model.Inbound, error) {
 	host, portText, err := net.SplitHostPort(strings.TrimSpace(dest))
 	if err != nil {
 		host, portText = "127.0.0.1", strings.TrimSpace(dest)
 	}
 	port, err := strconv.Atoi(portText)
 	if err != nil || port <= 0 {
-		return 0, nil
+		return nil, nil
 	}
-	q := tx.Model(&model.Inbound{}).Select("id", "listen").Where("port = ? AND id <> ?", port, master.Id)
+	q := tx.Model(&model.Inbound{}).Select("id", "listen", "stream_settings").Where("port = ? AND id <> ?", port, master.Id)
 	if master.NodeID == nil {
 		q = q.Where("node_id IS NULL")
 	} else {
@@ -255,17 +276,17 @@ func siblingInboundForDest(tx *gorm.DB, master *model.Inbound, dest string) (int
 	}
 	var candidates []model.Inbound
 	if err := q.Find(&candidates).Error; err != nil {
-		return 0, err
+		return nil, err
 	}
-	match := 0
-	for _, c := range candidates {
-		if fallbackChildHost(c.Listen) != host {
+	var match *model.Inbound
+	for i := range candidates {
+		if fallbackChildHost(candidates[i].Listen) != host {
 			continue
 		}
-		if match != 0 {
-			return 0, nil
+		if match != nil {
+			return nil, nil
 		}
-		match = c.Id
+		match = &candidates[i]
 	}
 	return match, nil
 }
@@ -301,4 +322,45 @@ func fallbackEntries(set model.FallbackSet) []map[string]any {
 		out = append(out, entry)
 	}
 	return out
+}
+
+// HasDerivedFallbackTo reports whether a master's fallback takes its dest and xver from childId.
+func (s *FallbackService) HasDerivedFallbackTo(tx *gorm.DB, childId int) (bool, error) {
+	var n int64
+	err := tx.Model(&model.InboundFallback{}).Where("child_id = ? AND TRIM(dest) = ''", childId).Count(&n).Error
+	return n > 0, err
+}
+
+// fallbackTargetChanged reports whether an edit changed what a derived fallback is built from.
+func fallbackTargetChanged(before, after *model.Inbound) bool {
+	return before.Listen != after.Listen || before.Port != after.Port ||
+		acceptsProxyProtocol(before.StreamSettings) != acceptsProxyProtocol(after.StreamSettings)
+}
+
+// proxyProtocolTransportKey maps the transports whose settings carry acceptProxyProtocol;
+// RAW is stored as tcp, older rows say raw.
+var proxyProtocolTransportKey = map[string]string{
+	"tcp":         "tcpSettings",
+	"raw":         "tcpSettings",
+	"ws":          "wsSettings",
+	"httpupgrade": "httpupgradeSettings",
+}
+
+// acceptsProxyProtocol reports whether an inbound's listener expects a PROXY header, via
+// sockopt or its transport, the two places xray-core wraps the listener.
+func acceptsProxyProtocol(streamSettings string) bool {
+	var stream map[string]any
+	if json.Unmarshal([]byte(streamSettings), &stream) != nil {
+		return false
+	}
+	if sockopt, _ := stream["sockopt"].(map[string]any); sockopt["acceptProxyProtocol"] == true {
+		return true
+	}
+	network, _ := stream["network"].(string)
+	key, ok := proxyProtocolTransportKey[strings.ToLower(network)]
+	if !ok {
+		return false
+	}
+	transport, _ := stream[key].(map[string]any)
+	return transport["acceptProxyProtocol"] == true
 }

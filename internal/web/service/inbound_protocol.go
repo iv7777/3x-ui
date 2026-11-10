@@ -7,6 +7,7 @@ import (
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/common"
 	"github.com/mhsanaei/3x-ui/v3/internal/util/version"
+	"github.com/mhsanaei/3x-ui/v3/internal/xray"
 
 	"gorm.io/gorm"
 )
@@ -28,7 +29,7 @@ func inboundShadowsocksMethod(protocol, settings string) string {
 }
 
 // inboundCanEnableTlsFlow mirrors the frontend's canEnableTlsFlow: xray-core runs Vision over
-// TLS/REALITY on raw TCP, or inside VLESS encryption (encryption.CommonConn) on any transport.
+// TLS/REALITY on raw TCP, or inside VLESS encryption on any transport but XDRIVE (#7182).
 func inboundCanEnableTlsFlow(protocol, streamSettings, settings string) bool {
 	if protocol != string(model.VLESS) {
 		return false
@@ -37,8 +38,11 @@ func inboundCanEnableTlsFlow(protocol, streamSettings, settings string) bool {
 		Network  string `json:"network"`
 		Security string `json:"security"`
 	}
-	if json.Unmarshal([]byte(streamSettings), &stream) == nil && stream.Network == "tcp" &&
-		(stream.Security == "tls" || stream.Security == "reality") {
+	_ = json.Unmarshal([]byte(streamSettings), &stream)
+	if stream.Network == "xdrive" {
+		return false
+	}
+	if stream.Network == "tcp" && (stream.Security == "tls" || stream.Security == "reality") {
 		return true
 	}
 	return vlessEncryptionEnabled(settings)
@@ -136,6 +140,9 @@ func inboundCanHostFallbacks(ib *model.Inbound) bool {
 	if ib.Protocol != model.VLESS && ib.Protocol != model.Trojan {
 		return false
 	}
+	if ib.Protocol == model.VLESS && vlessDecryptionEnabled(ib.Settings) {
+		return false
+	}
 	return streamSupportsFallbacks(ib.StreamSettings)
 }
 
@@ -157,4 +164,22 @@ func streamSupportsFallbacks(streamSettings string) bool {
 		return false
 	}
 	return stream.Security == "tls" || stream.Security == "reality"
+}
+
+// validateTunWfpBlockLeak refuses at save the autoSystemWfpBlockLeak values xray-core 26.10.31
+// (#7288) refuses when the core starts, which stops every inbound with it.
+func validateTunWfpBlockLeak(protocol, settings string) error {
+	if protocol != "tun" {
+		return nil
+	}
+	var tunSettings struct {
+		AutoSystemWfpBlockLeak []string `json:"autoSystemWfpBlockLeak"`
+	}
+	if json.Unmarshal([]byte(settings), &tunSettings) != nil {
+		return nil
+	}
+	if err := xray.ValidateTunWfpBlockLeak(tunSettings.AutoSystemWfpBlockLeak); err != nil {
+		return common.NewError("TUN autoSystemWfpBlockLeak: ", err)
+	}
+	return nil
 }

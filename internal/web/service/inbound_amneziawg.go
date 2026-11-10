@@ -9,6 +9,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/amneziawg"
+	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgkern"
 	"github.com/mhsanaei/3x-ui/v3/internal/amneziawgnet"
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
@@ -188,9 +189,13 @@ func storedAmneziaWGServerKeys(oldSettings string) (priv, pub string) {
 // valid server block, generating one (fresh obfuscation params + keypair) on
 // first save and validating a manually-edited one so a bad entry can't bring
 // the interface down on the next apply. A no-op for every other protocol.
-func (s *InboundService) normalizeAmneziaWGSettings(inbound *model.Inbound, oldSettings string) error {
+func (s *InboundService) normalizeAmneziaWGSettings(inbound *model.Inbound, old *model.Inbound) error {
 	if inbound.Protocol != model.AmneziaWG {
 		return nil
+	}
+	oldSettings := ""
+	if old != nil {
+		oldSettings = old.Settings
 	}
 
 	trimmed := strings.TrimSpace(inbound.Settings)
@@ -230,6 +235,9 @@ func (s *InboundService) normalizeAmneziaWGSettings(inbound *model.Inbound, oldS
 		*f = amneziawg.CanonicalizeUintRange(*f)
 	}
 	if err := amneziawg.ValidateServerObfuscation(parsed.Server.Obfuscation()); err != nil {
+		return fmt.Errorf("amneziawg: %w", err)
+	}
+	if err := amneziawg.ValidateMTU(parsed.Server.MTU); err != nil {
 		return fmt.Errorf("amneziawg: %w", err)
 	}
 	if err := amneziawg.ValidateIPv6Subnet(parsed.Server.IPv6Enabled, parsed.Server.IPv6Subnet); err != nil {
@@ -301,6 +309,51 @@ func (s *InboundService) normalizeAmneziaWGSettings(inbound *model.Inbound, oldS
 		return err
 	}
 	inbound.Settings = string(bs)
+
+	// Host readiness gates only a save that starts the kernel datapath: a host that
+	// later loses its module must still let the admin edit, disable or switch it.
+	if parsed.Server.KernelMode {
+		inst, ok := amneziawg.InstanceFromInbound(inbound)
+		if !ok {
+			inst = amneziawg.Instance{
+				Listen:           inbound.Listen,
+				IPv6Enabled:      parsed.Server.IPv6Enabled,
+				RouteThroughXray: parsed.Server.RouteThroughXray,
+			}
+			for _, client := range parsed.Clients {
+				if client.Enable {
+					inst.Peers = append(inst.Peers, amneziawg.Peer{
+						Email:          client.Email,
+						AllowedIPs:     client.AllowedIPs,
+						ForwardedPorts: client.ForwardedPortsSpec(),
+					})
+				}
+			}
+		}
+		if len(inst.Address) == 0 {
+			v4Base, _, err := defaultAmneziaWGSubnetBases(inbound.Settings)
+			if err != nil {
+				return err
+			}
+			inst.Address = []string{v4Base}
+		}
+		if inbound.Enable {
+			if err := amneziawgkern.ValidatePeerSubnets(inst); err != nil {
+				return err
+			}
+		}
+		if inbound.NodeID != nil {
+			return nil
+		}
+		check := amneziawgkern.ValidateInstanceFeatures
+		wasRunningKernel := old != nil && old.Enable && amneziawgKernelModeSettings(old.Settings)
+		if inbound.Enable && !wasRunningKernel {
+			check = amneziawgkern.Preflight
+		}
+		if err := check(inst, inst.RouteThroughXray); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -335,7 +388,7 @@ func (s *InboundService) loadPortConflictContext(db *gorm.DB, nodeID *int) (port
 // amneziaWGForwardedPortsConflict renders one client's ForwardedPorts collision,
 // or nil: the single copy both the pre-Save pass and the post-Save re-run use.
 func (s *InboundService) amneziaWGForwardedPortsConflict(ctx portConflictContext, c *model.Client) error {
-	hit := s.checkForwardedPortsConflict(ctx, c.ForwardedPorts)
+	hit := s.checkForwardedPortsConflict(ctx, c.ForwardedPortsSpec())
 	if hit == "" {
 		return nil
 	}
@@ -387,6 +440,9 @@ func (s *InboundService) checkForwardedPortsConflict(ctx portConflictContext, fo
 		var socksPort int
 		switch ib.Protocol {
 		case model.AmneziaWG:
+			if amneziawgKernelMode(ib) {
+				continue
+			}
 			socksPort = amneziawgnet.SOCKSPortForInbound(ib.Id)
 		case model.TUIC:
 			socksPort = tuic.SOCKSPortForInbound(ib.Id)

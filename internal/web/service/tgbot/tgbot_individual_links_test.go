@@ -2,6 +2,7 @@ package tgbot
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -23,17 +24,16 @@ func recordingBotServer(t *testing.T) func() []string {
 	var mu sync.Mutex
 	var texts []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/bot"+testBotToken+"/sendMessage" {
-			w.WriteHeader(http.StatusNotFound)
-			return
+		method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		switch method {
+		case "sendMessage", "sendPhoto":
+			// A screen is a photo message, so its caption travels as multipart
+			// form data; the raw body carries it either way.
+			raw, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			texts = append(texts, string(raw))
+			mu.Unlock()
 		}
-		var body struct {
-			Text string `json:"text"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		mu.Lock()
-		texts = append(texts, body.Text)
-		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": map[string]any{
 			"message_id": 1, "date": 0, "chat": map[string]any{"id": ownerTgID, "type": "private"},
@@ -85,5 +85,40 @@ func TestIndividualLinksDoNotNeedAResolvableHost(t *testing.T) {
 	got := strings.Join(sent(), "\n")
 	if !strings.Contains(got, "vless://"+uuid+"@203.0.113.5:443") {
 		t.Fatalf("bot sent %q, want the client's vless link", got)
+	}
+}
+
+// A client stored without a subId has no subscription; the blank value must not
+// be looked up as one, or it selects every other client stored without a subId.
+func TestIndividualLinksOfBlankSubIdClientExposeNoOtherClient(t *testing.T) {
+	sent := recordingBotServer(t)
+	dbtest.InitDB(t, filepath.Join(t.TempDir(), "x-ui.db"))
+	service.RegisterSubLinkProvider(sub.NewLinkProvider())
+
+	const ownerUUID = "11111111-2222-4333-8444-555555555555"
+	const otherUUID = "99999999-2222-4333-8444-555555555555"
+	inboundSvc := service.InboundService{}
+	_, _, err := inboundSvc.AddInbound(&model.Inbound{
+		UserId: 1, Tag: "in-443", Enable: true, Listen: "203.0.113.5", Port: 443,
+		Protocol: model.VLESS, Remark: "in", StreamSettings: `{"network":"tcp","security":"none"}`,
+		Settings: `{"clients":[{"id":"` + ownerUUID + `","email":"` + ownerMail + `","tgId":4242,"enable":true},` +
+			`{"id":"` + otherUUID + `","email":"other@x","enable":true}],"decryption":"none"}`,
+	})
+	if err != nil {
+		t.Fatalf("AddInbound: %v", err)
+	}
+
+	origRunning := isRunning
+	t.Cleanup(func() { isRunning = origRunning })
+	isRunning = true
+
+	tapClientLinks(t, &Tgbot{}, ownerTgID, "client_individual_links "+ownerMail)
+
+	got := strings.Join(sent(), "\n")
+	if !strings.Contains(got, "vless://"+ownerUUID+"@203.0.113.5:443") {
+		t.Errorf("bot sent %q, want the client's own vless link", got)
+	}
+	if strings.Contains(got, otherUUID) {
+		t.Errorf("bot sent another client's credentials to %s: %q", ownerMail, got)
 	}
 }

@@ -75,6 +75,7 @@ describe('parseVmessLink', () => {
       ech: 'AEX+DQBB',
       vcn: 'vcn.example.com',
       pcs: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+      cs: 'TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256',
     };
     const link = `vmess://${Base64.encode(JSON.stringify(json))}`;
     const out = parseVmessLink(link);
@@ -82,6 +83,7 @@ describe('parseVmessLink', () => {
     const stream = out?.streamSettings as Record<string, unknown>;
     const tls = stream.tlsSettings as Record<string, unknown>;
     expect(tls.echConfigList).toBe('AEX+DQBB');
+    expect(tls.cipherSuites).toBe('TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256');
     expect(tls.verifyPeerCertByName).toBe('vcn.example.com');
     expect(tls.pinnedPeerCertSha256).toBe('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=');
   });
@@ -427,6 +429,15 @@ describe('parseTrojanLink', () => {
     const stream = out?.streamSettings as Record<string, unknown>;
     expect(stream.network).toBe('ws');
     expect((stream.wsSettings as Record<string, unknown>).path).toBe('/tj');
+  });
+
+  it('reads the cs cipher suites into tlsSettings, as the Go link parser does', () => {
+    const out = parseTrojanLink(
+      'trojan://pw@srv.example:443?type=tcp&security=tls&sni=srv.example&fp=unsafe&cs=TLS_AES_256_GCM_SHA384#cs',
+    );
+    const stream = out!.streamSettings as Record<string, unknown>;
+    const tls = stream.tlsSettings as Record<string, unknown>;
+    expect(tls.cipherSuites).toBe('TLS_AES_256_GCM_SHA384');
   });
 });
 
@@ -1111,5 +1122,34 @@ describe('obfs=gecko packetSize validation', () => {
     ['over cap', `${base}&minPacketSize=512&maxPacketSize=4096`],
   ])('drops the %s range', (_name, link) => {
     expect(packetSizeOf(link)).toBeUndefined();
+  });
+});
+
+describe('parseOutboundLink — host-local keys', () => {
+  it('drops keys that redirect the dial or name host files, however they are cased', () => {
+    const extra = encodeURIComponent(
+      JSON.stringify({
+        downloadSettings: {
+          address: '8.8.8.8',
+          port: 443,
+          sockopt: { dialerProxy: 'api', tcpFastOpen: true },
+          tlsSettings: {
+            serverName: 'cdn.example.com',
+            certificates: [{ CERTIFICATEFILE: '/dev/zero', keyFile: '/etc/shadow' }],
+            maſterKeyLog: '/root/keys',
+          },
+        },
+      }),
+    );
+    const fm = encodeURIComponent(
+      JSON.stringify({ tcp: [{ type: 'header-custom', settings: { DialerProxy: 'api' } }] }),
+    );
+    const out = parseOutboundLink(
+      `vless://uuid@8.8.8.8:443?type=xhttp&security=tls&extra=${extra}&fm=${fm}#node`,
+    );
+    const json = JSON.stringify(out);
+    expect(json).not.toMatch(/dialerproxy|certificatefile|keyfile|maſterkeylog/i);
+    expect(json).toContain('"tcpFastOpen":true');
+    expect(json).toContain('"serverName":"cdn.example.com"');
   });
 });

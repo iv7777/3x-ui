@@ -43,9 +43,10 @@ func (a *IndexController) initRouter(g *gin.RouterGroup) {
 	g.GET("/", a.index)
 	g.GET("/csrf-token", a.csrfToken)
 
-	g.POST("/login", middleware.CSRFMiddleware(), a.login)
-	g.POST("/logout", middleware.CSRFMiddleware(), a.logout)
-	g.POST("/getTwoFactorEnable", middleware.CSRFMiddleware(), a.getTwoFactorEnable)
+	// The route carries three short fields; anything longer is refused unread.
+	g.POST("/login", middleware.MaxBodyBytes(16<<10), middleware.CSRFMiddleware(getRemoteIp), a.login)
+	g.POST("/logout", middleware.CSRFMiddleware(getRemoteIp), a.logout)
+	g.POST("/getTwoFactorEnable", middleware.CSRFMiddleware(getRemoteIp), a.getTwoFactorEnable)
 }
 
 // index handles the root route, redirecting logged-in users to the panel or showing the login page.
@@ -76,6 +77,12 @@ func (a *IndexController) login(c *gin.Context) {
 	}
 
 	remoteIP := getRemoteIp(c)
+	// No stored name is longer; the log buffer, the limiter and the notifiers keep what follows.
+	if len(form.Username) > panel.MaxUsernameLength {
+		logger.Warningf("failed login: IP=%q, reason=%q", remoteIP, "username too long")
+		pureJsonMsg(c, http.StatusOK, false, I18nWeb(c, "pages.login.toasts.wrongUsernameOrPassword"))
+		return
+	}
 	safeUser := template.HTMLEscapeString(form.Username)
 	timeStr := time.Now().Format("2006-01-02 15:04:05")
 	if blockedUntil, ok := defaultLoginLimiter.allow(remoteIP, form.Username); !ok {

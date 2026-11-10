@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -31,6 +32,7 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -57,11 +59,7 @@ func Dialect() string {
 	return db.Name()
 }
 
-const (
-	defaultUsername       = "admin"
-	defaultPassword       = "admin"
-	sqliteBackupDirPrefix = ".x-ui-backup-"
-)
+const sqliteBackupDirPrefix = ".x-ui-backup-"
 
 func allModels() []any {
 	return []any{
@@ -81,6 +79,7 @@ func allModels() []any {
 		&model.ClientGroup{},
 		&model.InboundFallback{},
 		&model.Host{},
+		&model.HostTombstone{},
 		&model.NodeClientTraffic{},
 		&model.NodeClientIp{},
 		&model.ClientGlobalTraffic{},
@@ -115,7 +114,18 @@ func migrateInboundExcludeFromSubColumn() error {
 	return migrator.AddColumn(&model.Inbound{}, "ExcludeFromSub")
 }
 
+func migrateClientKeepAliveRangeColumn() error {
+	migrator := db.Migrator()
+	if !migrator.HasTable(&model.ClientRecord{}) || migrator.HasColumn(&model.ClientRecord{}, "wg_keep_alive_range") {
+		return nil
+	}
+	return migrator.AddColumn(&model.ClientRecord{}, "KeepAliveRange")
+}
+
 func initModels() error {
+	if err := migrateClientKeepAliveRangeColumn(); err != nil {
+		return err
+	}
 	if err := migrateClientTrafficLastSubFetchColumn(); err != nil {
 		return err
 	}
@@ -395,7 +405,10 @@ func migrateSyncOrphanColumns() error {
 	if !db.Migrator().HasColumn(&model.ClientRecord{}, "sync_orphaned_at") {
 		return nil
 	}
-	return db.Exec("UPDATE clients SET sync_orphaned_at = 0 WHERE sync_orphaned_at IS NULL").Error
+	if err := db.Exec("UPDATE clients SET sync_orphaned_at = 0 WHERE sync_orphaned_at IS NULL").Error; err != nil {
+		return err
+	}
+	return db.Exec("UPDATE clients SET sync_orphaned_by = 0 WHERE sync_orphaned_by IS NULL").Error
 }
 
 // The client identity checks match emails case-insensitively; without an
@@ -429,6 +442,17 @@ func migrateHostVerifyPeerCertByNameColumn() error {
 	}
 
 	return db.Exec(`UPDATE hosts SET verify_peer_cert_by_name = '' WHERE verify_peer_cert_by_name IS NULL OR typeof(verify_peer_cert_by_name) <> 'text'`).Error
+}
+
+// mihomo_x25519 was saved but ignored until it began dropping ML-KEM, so rows set
+// back then are cleared once rather than silently changing their subscriptions.
+func resetPreexistingMihomoX25519() error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.Host{}).Where("mihomo_x25519 = ?", true).Update("mihomo_x25519", false).Error; err != nil {
+			return err
+		}
+		return tx.Create(&model.HistoryOfSeeders{SeederName: "HostMihomoX25519Reset"}).Error
+	})
 }
 
 // AutoMigrate casts the boolean-era column to text before the migration above runs,
@@ -821,29 +845,149 @@ func mtprotoInboundClientEmail(remark string, used map[string]struct{}) string {
 // first run, so a freshly imported inbound must be converted here instead. Blank
 // or malformed streamSettings, or one without externalProxy entries, is a no-op.
 func CreateHostsFromExternalProxy(tx *gorm.DB, inboundId int, streamSettings string) (int, error) {
-	if strings.TrimSpace(streamSettings) == "" {
-		return 0, nil
-	}
-	var stream map[string]any
-	if err := json.Unmarshal([]byte(streamSettings), &stream); err != nil {
-		return 0, nil
-	}
-	eps, ok := stream["externalProxy"].([]any)
-	if !ok || len(eps) == 0 {
-		return 0, nil
-	}
+	imports, _ := externalProxyHosts(inboundId, streamSettings)
 	created := 0
-	for i, raw := range eps {
-		ep, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if err := tx.Create(externalProxyEntryToHost(inboundId, i, ep)).Error; err != nil {
+	for _, host := range imports {
+		if err := tx.Create(host).Error; err != nil {
 			return created, err
 		}
 		created++
 	}
 	return created, nil
+}
+
+// SyncHostsFromExternalProxy carries the entries an inbound update changed onto the hosts
+// still exactly as imported; a stream without the externalProxy key leaves hosts alone.
+func SyncHostsFromExternalProxy(tx *gorm.DB, inboundId int, oldStreamSettings, newStreamSettings string) error {
+	newImports, listed := externalProxyHosts(inboundId, newStreamSettings)
+	if !listed {
+		return nil
+	}
+	oldImports, _ := externalProxyHosts(inboundId, oldStreamSettings)
+	gone, added := changedImports(oldImports, newImports)
+	if len(gone) == 0 && len(added) == 0 {
+		return nil
+	}
+	untouched, err := untouchedImportedHosts(tx, inboundId, oldImports)
+	if err != nil || untouched == nil {
+		return err
+	}
+	for i, old := range gone {
+		host := untouched[old]
+		if host == nil {
+			continue
+		}
+		if i >= len(added) {
+			if _, err := DeleteHosts(tx, "id = ?", host.Id); err != nil {
+				return err
+			}
+			continue
+		}
+		added[i].Id, added[i].GroupId, added[i].SortOrder, added[i].CreatedAt = host.Id, host.GroupId, host.SortOrder, host.CreatedAt
+		if err := tx.Save(added[i]).Error; err != nil {
+			return err
+		}
+	}
+	for _, host := range added[min(len(gone), len(added)):] {
+		if err := tx.Create(host).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// changedImports drops the entries both lists share and returns, in list order, the old
+// positions that changed or went away and the new entries that changed or appeared.
+func changedImports(oldImports, newImports []*model.Host) ([]int, []*model.Host) {
+	kept := make([]bool, len(oldImports))
+	var added []*model.Host
+	for _, next := range newImports {
+		match := -1
+		for i, prev := range oldImports {
+			if !kept[i] && sameImportedHost(prev, next) {
+				match = i
+				break
+			}
+		}
+		if match < 0 {
+			added = append(added, next)
+			continue
+		}
+		kept[match] = true
+	}
+	var gone []int
+	for i := range oldImports {
+		if !kept[i] {
+			gone = append(gone, i)
+		}
+	}
+	return gone, added
+}
+
+// untouchedImportedHosts pairs each old import with a row still equal to it and alone in its
+// group (nil where the admin edited, shared or deleted it); nil when no row qualifies.
+func untouchedImportedHosts(tx *gorm.DB, inboundId int, imports []*model.Host) ([]*model.Host, error) {
+	var stored []*model.Host
+	if err := tx.Where("inbound_id = ?", inboundId).Order("sort_order asc, id asc").Find(&stored).Error; err != nil {
+		return nil, err
+	}
+	paired := make([]*model.Host, len(imports))
+	found := false
+	for i, want := range imports {
+		for _, host := range stored {
+			if slices.Contains(paired, host) || !sameImportedHost(host, want) {
+				continue
+			}
+			var groupRows int64
+			if err := tx.Model(&model.Host{}).Where("group_id = ?", host.GroupId).Count(&groupRows).Error; err != nil {
+				return nil, err
+			}
+			if groupRows == 1 {
+				paired[i], found = host, true
+				break
+			}
+		}
+	}
+	if !found {
+		return nil, nil
+	}
+	return paired, nil
+}
+
+// externalProxyHosts maps each entry to the host an import creates; the bool reports whether
+// the stream carries an externalProxy list at all, an empty one included.
+func externalProxyHosts(inboundId int, streamSettings string) ([]*model.Host, bool) {
+	if strings.TrimSpace(streamSettings) == "" {
+		return nil, false
+	}
+	var stream map[string]any
+	if err := json.Unmarshal([]byte(streamSettings), &stream); err != nil {
+		return nil, false
+	}
+	eps, listed := stream["externalProxy"].([]any)
+	var hosts []*model.Host
+	for i, raw := range eps {
+		if ep, ok := raw.(map[string]any); ok {
+			hosts = append(hosts, externalProxyEntryToHost(inboundId, i, ep))
+		}
+	}
+	return hosts, listed
+}
+
+// sameImportedHost compares every field but row identity and placement, so a host the
+// admin changed in any way no longer counts as the import; empty lists match nil.
+func sameImportedHost(a, b *model.Host) bool {
+	return reflect.DeepEqual(importedHostFields(*a), importedHostFields(*b))
+}
+
+func importedHostFields(h model.Host) model.Host {
+	h.Id, h.GroupId, h.SortOrder, h.CreatedAt, h.UpdatedAt = 0, "", 0, 0, 0
+	for _, list := range []*[]string{&h.Tags, &h.Alpn, &h.PinnedPeerCertSha256, &h.ExcludeFromSubTypes, &h.NodeGuids} {
+		if len(*list) == 0 {
+			*list = nil
+		}
+	}
+	return h
 }
 
 func externalProxyEntryToHost(inboundId, index int, ep map[string]any) *model.Host {
@@ -877,10 +1021,12 @@ func externalProxyEntryToHost(inboundId, index int, ep map[string]any) *model.Ho
 		Port:                 port,
 		Security:             security,
 		Sni:                  sni,
+		Snis:                 anyToNonEmptyStrings([]any{sni}),
 		Fingerprint:          fingerprint,
 		Alpn:                 anyToNonEmptyStrings(ep["alpn"]),
 		PinnedPeerCertSha256: anyToNonEmptyStrings(ep["pinnedPeerCertSha256"]),
 		EchConfigList:        ech,
+		RandomCount:          1,
 	}
 }
 
@@ -908,15 +1054,41 @@ func anyToNonEmptyStrings(v any) []string {
 }
 
 func pruneOrphanedHosts() error {
-	res := db.Exec("DELETE FROM hosts WHERE inbound_id NOT IN (SELECT id FROM inbounds)")
-	if res.Error != nil {
-		log.Printf("Error pruning orphaned hosts rows: %v", res.Error)
-		return res.Error
+	var pruned int64
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		pruned, err = DeleteHosts(tx, "inbound_id NOT IN (SELECT id FROM inbounds)")
+		return err
+	})
+	if err != nil {
+		log.Printf("Error pruning orphaned hosts rows: %v", err)
+		return err
 	}
-	if res.RowsAffected > 0 {
-		log.Printf("Pruned %d orphaned hosts row(s)", res.RowsAffected)
+	if pruned > 0 {
+		log.Printf("Pruned %d orphaned hosts row(s)", pruned)
 	}
 	return nil
+}
+
+// DeleteHosts deletes the hosts matching query and keeps each one's inbound in host_tombstones, in
+// the caller's transaction, so a client still bound to one fails closed on that inbound alone.
+func DeleteHosts(tx *gorm.DB, query any, args ...any) (int64, error) {
+	var tombstones []model.HostTombstone
+	if err := tx.Model(&model.Host{}).Select("id AS host_id, inbound_id").Where(query, args...).Scan(&tombstones).Error; err != nil {
+		return 0, err
+	}
+	if len(tombstones) == 0 {
+		return 0, nil
+	}
+	// migrate-db resyncs the hosts sequence to MAX(id), so a deleted id can return; keep its latest inbound.
+	if err := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "host_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"inbound_id"}),
+	}).CreateInBatches(&tombstones, 500).Error; err != nil {
+		return 0, err
+	}
+	res := tx.Where(query, args...).Delete(&model.Host{})
+	return res.RowsAffected, res.Error
 }
 
 func pruneOrphanedClientInbounds() error {
@@ -1316,26 +1488,22 @@ func isIgnorableDuplicateColumnErr(gdb *gorm.DB, err error, mdl any) bool {
 	return false
 }
 
-func initUser() error {
+// EnsureFirstUser creates the panel's first user with random credentials and returns
+// them, or returns "" when one exists; only the starting server calls it, so it can print them.
+func EnsureFirstUser() (username, password string, err error) {
 	empty, err := isTableEmpty("users")
+	if err != nil || !empty {
+		return "", "", err
+	}
+	username, password = random.Seq(10), random.Seq(16)
+	hashedPassword, err := crypto.HashPasswordAsBcrypt(password)
 	if err != nil {
-		log.Printf("Error checking if users table is empty: %v", err)
-		return err
+		return "", "", err
 	}
-	if empty {
-		hashedPassword, err := crypto.HashPasswordAsBcrypt(defaultPassword)
-		if err != nil {
-			log.Printf("Error hashing default password: %v", err)
-			return err
-		}
-
-		user := &model.User{
-			Username: defaultUsername,
-			Password: hashedPassword,
-		}
-		return db.Create(user).Error
+	if err := db.Create(&model.User{Username: username, Password: hashedPassword}).Error; err != nil {
+		return "", "", err
 	}
-	return nil
+	return username, password, nil
 }
 
 func seedRandomSubscriptionPaths() error {
@@ -1362,7 +1530,7 @@ func runSeeders(isUsersEmpty bool) error {
 	}
 
 	if empty && isUsersEmpty {
-		seeders := []string{"UserPasswordHash", "ClientsTable", "InboundClientsArrayFix", "InboundClientTgIdFix2", "InboundClientSubIdFix", "FreedomFinalRulesReverseFix", "FreedomFinalRulesPrivateEgressBlock", "UppercaseFreedomFinalRulesFix", "InboundRealityFinalmaskTcpStrip", "ApiTokensHash", "LegacyProxySettingsCleanup", "OutboundRemovedKeysFix", "FreedomDomainStrategyFix", "DNSOutboundLegacyKeysFix", "DNSOutboundQTypeZeroFix", "WireguardDomainStrategyFix", "XdnsFinalmaskNamesAddrsFix", "UDPHopClientMaskFix", "HostVerifyPeerCertByNameBoolFix", "WireguardPeersToClients", "MtprotoSecretsToClients", "NodeInboundsAdopted", "ResetIpLimitNoFail2ban"}
+		seeders := []string{"UserPasswordHash", "ClientsTable", "InboundClientsArrayFix", "InboundClientTgIdFix2", "InboundClientSubIdFix", "FreedomFinalRulesReverseFix", "FreedomFinalRulesPrivateEgressBlock", "UppercaseFreedomFinalRulesFix", "InboundRealityFinalmaskTcpStrip", "ApiTokensHash", "LegacyProxySettingsCleanup", "SessionSecretRotation", "OutboundRemovedKeysFix", "FreedomDomainStrategyFix", "DNSOutboundLegacyKeysFix", "DNSOutboundQTypeZeroFix", "WireguardDomainStrategyFix", "XdnsFinalmaskNamesAddrsFix", "UDPHopClientMaskFix", "HostVerifyPeerCertByNameBoolFix", "HostMihomoX25519Reset", "WireguardPeersToClients", "MtprotoSecretsToClients", "NodeInboundsAdopted", "NodeDownNotified", "ResetIpLimitNoFail2ban", "ClientGroupNameTrim", "OwnerlessClientHwidPurge", "ClientForwardedPortsBackfill"}
 		for _, name := range seeders {
 			if err := db.Create(&model.HistoryOfSeeders{SeederName: name}).Error; err != nil {
 				return err
@@ -1473,6 +1641,12 @@ func runSeeders(isUsersEmpty bool) error {
 		}
 	}
 
+	if !slices.Contains(seedersHistory, "SessionSecretRotation") {
+		if err := dropPreUpgradeSessionSecret(); err != nil {
+			return err
+		}
+	}
+
 	if !slices.Contains(seedersHistory, "OutboundRemovedKeysFix") {
 		if err := migrateOutboundRemovedKeys(); err != nil {
 			return err
@@ -1521,8 +1695,38 @@ func runSeeders(isUsersEmpty bool) error {
 		}
 	}
 
+	if !slices.Contains(seedersHistory, "HostMihomoX25519Reset") {
+		if err := resetPreexistingMihomoX25519(); err != nil {
+			return err
+		}
+	}
+
 	if !slices.Contains(seedersHistory, "NodeInboundsAdopted") {
 		if err := seedNodeInboundsAdopted(); err != nil {
+			return err
+		}
+	}
+
+	if !slices.Contains(seedersHistory, "NodeDownNotified") {
+		if err := seedNodeDownNotified(); err != nil {
+			return err
+		}
+	}
+
+	if !slices.Contains(seedersHistory, "ClientGroupNameTrim") {
+		if err := trimClientGroupNames(); err != nil {
+			return err
+		}
+	}
+
+	if !slices.Contains(seedersHistory, "OwnerlessClientHwidPurge") {
+		if err := purgeOwnerlessClientHwids(); err != nil {
+			return err
+		}
+	}
+
+	if !slices.Contains(seedersHistory, "ClientForwardedPortsBackfill") {
+		if err := backfillClientForwardedPorts(); err != nil {
 			return err
 		}
 	}
@@ -1574,6 +1778,17 @@ func seedNodeInboundsAdopted() error {
 		return err
 	}
 	return db.Create(&model.HistoryOfSeeders{SeederName: "NodeInboundsAdopted"}).Error
+}
+
+// seedNodeDownNotified treats nodes already offline at upgrade as announced,
+// so the first heartbeat after it does not re-send their node.down.
+func seedNodeDownNotified() error {
+	if err := db.Model(&model.Node{}).
+		Where("status = ?", "offline").
+		Update("down_notified", true).Error; err != nil {
+		return err
+	}
+	return db.Create(&model.HistoryOfSeeders{SeederName: "NodeDownNotified"}).Error
 }
 
 // backfillEmptyHostGroupIds is idempotent and not seeder-gated: builds that
@@ -1708,6 +1923,83 @@ func clearLegacyProxySettings() error {
 			return err
 		}
 		return tx.Create(&model.HistoryOfSeeders{SeederName: "LegacyProxySettingsCleanup"}).Error
+	})
+}
+
+// The client editor fills forwardedPorts from the record, which kept the value it was created
+// with; an emptied field now withdraws the forwards, so the record must hold the live spec.
+func backfillClientForwardedPorts() error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		var inbounds []model.Inbound
+		if err := tx.Select("id", "settings").Where("protocol = ?", model.AmneziaWG).Find(&inbounds).Error; err != nil {
+			return err
+		}
+		for _, ib := range inbounds {
+			var parsed struct {
+				Clients []struct {
+					Email          string `json:"email"`
+					ForwardedPorts string `json:"forwardedPorts"`
+				} `json:"clients"`
+			}
+			if json.Unmarshal([]byte(ib.Settings), &parsed) != nil {
+				continue
+			}
+			for _, c := range parsed.Clients {
+				spec := strings.TrimSpace(c.ForwardedPorts)
+				if c.Email == "" || spec == "" {
+					continue
+				}
+				if err := tx.Model(&model.ClientRecord{}).
+					Where("email = ? AND (wg_forwarded_ports IS NULL OR wg_forwarded_ports = '')", c.Email).
+					UpdateColumn("wg_forwarded_ports", spec).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return tx.Create(&model.HistoryOfSeeders{SeederName: "ClientForwardedPortsBackfill"}).Error
+	})
+}
+
+// The HWID gate stored a row for any subId a request named, owned or not; those rows
+// belong to no subscription and only grow the database.
+func purgeOwnerlessClientHwids() error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("sub_id NOT IN (SELECT sub_id FROM clients WHERE sub_id IS NOT NULL)").
+			Delete(&model.ClientHwid{}).Error; err != nil {
+			return err
+		}
+		return tx.Create(&model.HistoryOfSeeders{SeederName: "OwnerlessClientHwidPurge"}).Error
+	})
+}
+
+// The groups page addresses a group by its trimmed name, so a padded stored name listed as
+// its own group while every action on it hit the trimmed one.
+func trimClientGroupNames() error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		var names []string
+		if err := tx.Model(&model.ClientRecord{}).Distinct().Pluck("group_name", &names).Error; err != nil {
+			return err
+		}
+		for _, name := range names {
+			if trimmed := strings.TrimSpace(name); trimmed != name {
+				if err := tx.Model(&model.ClientRecord{}).Where("group_name = ?", name).
+					UpdateColumn("group_name", trimmed).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return tx.Create(&model.HistoryOfSeeders{SeederName: "ClientGroupNameTrim"}).Error
+	})
+}
+
+// Secrets stored before v2.8.3 came from math/rand (a 31-bit clock seed up to v2.1.3);
+// GetSecret draws a crypto/rand one on the next start.
+func dropPreUpgradeSessionSecret() error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("key = ?", "secret").Delete(&model.Setting{}).Error; err != nil {
+			return err
+		}
+		return tx.Create(&model.HistoryOfSeeders{SeederName: "SessionSecretRotation"}).Error
 	})
 }
 
@@ -2945,6 +3237,11 @@ func seedClientsFromInboundJSON() error {
 					continue
 				}
 				model.NormalizeLegacyClientFields(obj)
+				// Releases before 3.1.0 served a client whose JSON carries no
+				// switch; only an explicit false means disabled.
+				if obj["enable"] == nil {
+					obj["enable"] = true
+				}
 				blob, err := json.Marshal(obj)
 				if err != nil {
 					continue
@@ -2965,6 +3262,14 @@ func seedClientsFromInboundJSON() error {
 				if !dup {
 					if err := tx.Create(incoming).Error; err != nil {
 						return err
+					}
+					// gorm default:true drops enable=false on Create — restate (#6478).
+					if !c.Enable {
+						if err := tx.Model(&model.ClientRecord{}).Where("id = ?", incoming.Id).
+							UpdateColumn("enable", false).Error; err != nil {
+							return err
+						}
+						incoming.Enable = false
 					}
 					byEmail[email] = incoming
 					row = incoming
@@ -3144,10 +3449,6 @@ func InitDB(dbPath string) error {
 		if err := seedRandomSubscriptionPaths(); err != nil {
 			return err
 		}
-	}
-
-	if err := initUser(); err != nil {
-		return err
 	}
 	return runSeeders(isUsersEmpty)
 }
