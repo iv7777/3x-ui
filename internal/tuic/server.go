@@ -1045,7 +1045,7 @@ func (s *Server) sendUDPPacketFragments(
 				stream.CancelWrite(0)
 				return err
 			}
-			if err := stream.Close(); err != nil {
+			if err := finishResponseStream(stream); err != nil {
 				return err
 			}
 			continue
@@ -1053,6 +1053,15 @@ func (s *Server) sendUDPPacketFragments(
 		if err := conn.SendDatagram(frame.Bytes()); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// A Close that fails on an already-ended stream means the client read its response and sent
+// STOP_SENDING; the packet was delivered, so it must not stop the association's response loop.
+func finishResponseStream(stream *quic.SendStream) error {
+	if err := stream.Close(); err != nil && stream.Context().Err() == nil {
+		return err
 	}
 	return nil
 }

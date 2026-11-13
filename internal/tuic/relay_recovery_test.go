@@ -265,3 +265,35 @@ func TestUDPReaderCleanupCannotDeleteReplacementAssociation(t *testing.T) {
 		t.Fatal("current reader cleanup retained dead association")
 	}
 }
+
+func TestResponseStreamCancelledByClientAfterReadIsNotAFailure(t *testing.T) {
+	s, client, id, _ := startLifecycleTestServer(t, "127.0.0.1:1", "cancelled-response@x")
+	serverConn, _ := authenticatedServerConnection(t, s, id)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out, err := serverConn.OpenUniStreamSync(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.Write([]byte("r")); err != nil {
+		t.Fatal(err)
+	}
+	in, err := client.AcceptUniStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(in, make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	in.CancelRead(0)
+	select {
+	case <-out.Context().Done():
+	case <-ctx.Done():
+		t.Fatal("the server stream never saw the client cancel")
+	}
+
+	if err := finishResponseStream(out); err != nil {
+		t.Fatalf("a response the client already read was reported as failed: %v", err)
+	}
+}
