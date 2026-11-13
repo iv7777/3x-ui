@@ -66,6 +66,25 @@ func TestPWAHeadInjectionUsesRuntimeBasePath(t *testing.T) {
 	}
 }
 
+func TestPWAHeadInjectionLinksServedTabIcons(t *testing.T) {
+	for _, basePath := range []string{"/", "/panel-secret/"} {
+		head := string(pwaHeadInjection(basePath, "index.html"))
+		for _, want := range []string{
+			`<link rel="icon" type="image/png" sizes="32x32" href="` + basePath + `icons/3x-ui-32.png">`,
+			`<link rel="icon" type="image/png" sizes="16x16" href="` + basePath + `icons/3x-ui-16.png">`,
+			`<link rel="apple-touch-icon" href="` + basePath + `icons/3x-ui-192.png">`,
+		} {
+			if !strings.Contains(head, want) {
+				t.Fatalf("base %q: head %q lacks %q", basePath, head, want)
+			}
+			name := strings.TrimPrefix(strings.Split(strings.Split(want, `href="`)[1], `"`)[0], basePath)
+			if _, ok := pwaAssets[name]; !ok {
+				t.Fatalf("%q is linked but ServePWAIcon would answer 404", name)
+			}
+		}
+	}
+}
+
 func TestPWAHeadInjectionSkipsSubscriptionPage(t *testing.T) {
 	if got := pwaHeadInjection("/panel-secret/", "subpage.html"); got != nil {
 		t.Fatalf("subpage injection = %q, want nil", got)
